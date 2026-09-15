@@ -597,10 +597,8 @@ Global-only, like `agent_config`: it decides which process runs with this machin
 
 ```yaml
 assignment:
-  hook_path: /opt/firstmate/bin/fm-route
-  hook_args: ["--json"]
+  hook_path: /opt/firstmate/bin/fm-route.sh
   hook_timeout: 30s
-  max_evidence_age: 10m
   profiles:
     - id: claude-opus
       agent: claude
@@ -625,20 +623,46 @@ assignment:
       roles: ["review-fix"]
 ```
 
-`hook_path` and `hook_args` name the executable and its fixed leading arguments.
-It is run directly, never through a shell, and receives one JSON request on standard input: the assignment identity, this daemon's owner and generation, the role, and the profile ids it may choose among.
-It answers with one JSON object naming a selected id, or reporting that it deferred.
+`hook_path` names the executable, and `hook_args` any fixed arguments it needs before the verb (most hooks need none).
+no-mistakes appends the verb (`acquire` or `finish`) as the final argument and writes one JSON request to standard input.
+It is run directly, never through a shell, so no part of the request can be read as a command.
+
+The request carries the assignment id, this daemon's owner identity and generation, and the ids the hook may choose among:
+
+```json
+{
+  "assignment_id": "01JC...-launch-3",
+  "owner": {"identity": "no-mistakes-daemon", "generation": "4242-1757951000000000000"},
+  "routes": ["claude-opus", "codex-sol", "pi-grok"]
+}
+```
+
+The hook answers with one JSON object. Only `"result": "selected"` authorizes a launch:
+
+```json
+{"result": "selected", "route_id": "codex-sol", "reason": "fewest-pending", "generation": 5}
+{"result": "deferred", "reason": "every candidate route is excluded", "generation": 5}
+{"result": "already-closed", "reason": "already closed; not relaunched"}
+{"result": "error", "error": "unknown route id: bogus"}
+```
 
 A hook can only pick from the ids you listed here.
 It cannot name a command, a path, a model, or a route you did not approve.
-Anything else - an unknown id, unreadable or oversized output, a nonzero exit, a timeout - stops that invocation with an error and launches nothing.
+Anything else - an unknown id, unreadable or oversized output, a reply that is not `selected`, a nonzero exit, a timeout - stops that invocation with an error and launches nothing.
 It never quietly falls back to your default agent, because that is exactly how an excluded service would end up running anyway.
 
 A deferral is not a failure and is not remembered.
 It means no approved service is admissible right now, and the same work can be retried once the hook's evidence refreshes.
 
+`already-closed` means that exact launch already ran.
+It carries no route on purpose, so it can never authorize a second run of work the hook has already counted.
+Every launch gets its own assignment id, so a retry or a recovered turn is a new launch rather than a replay of a spent one.
+
+When a turn ends, no-mistakes calls `finish` with the assignment id, the outcome, and the profile that actually ran.
+A completed turn reports `success`; anything else reports `launch-failed`, which releases the assignment without claiming the service is broken.
+The hook's other outcomes (`auth-failed`, `exhausted`, `outage`) take a route out of the pool for every caller on the machine, so no-mistakes never reports one on a guess about why a turn failed.
+
 `hook_timeout` bounds one hook call (default 30s).
-`max_evidence_age` bounds how old the hook's own observation may be before a selection is logged as made from evidence it could not date as current; it is recorded, not enforced, because the hook owns eligibility.
 
 Each profile needs an `id` unique to this file, an `agent`, and a `provider`.
 `agent` must be `claude`, `codex`, or `pi`; those are the adapters whose session, structured-output, and project-instruction behavior no-mistakes verifies natively.

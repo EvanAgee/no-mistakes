@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -11,33 +12,40 @@ import (
 
 // recordingHook captures every request a router makes and replies from a
 // script, so the router's own invariants are testable without a process.
+// seenRequest is one call the router made: the subcommand plus its payload.
+type seenRequest struct {
+	verb Verb
+	req  Request
+}
+
 type recordingHook struct {
 	mu       sync.Mutex
-	requests []Request
-	reply    func(Request) Response
-	fail     func(Request) error
+	requests []seenRequest
+	reply    func(Verb, Request) Response
+	fail     func(Verb, Request) error
 }
 
 func newRecordingHook(t *testing.T, rh *recordingHook) *Hook {
 	t.Helper()
 	return &Hook{
 		Path: "recording",
-		run: func(_ context.Context, _ string, _ []string, stdin []byte) ([]byte, error) {
+		run: func(_ context.Context, _ string, args []string, stdin []byte) ([]byte, error) {
+			verb := verbFromArgs(args)
 			var req Request
 			if err := json.Unmarshal(stdin, &req); err != nil {
 				t.Fatalf("unreadable request: %v", err)
 			}
 			rh.mu.Lock()
-			rh.requests = append(rh.requests, req)
+			rh.requests = append(rh.requests, seenRequest{verb: verb, req: req})
 			fail, reply := rh.fail, rh.reply
 			rh.mu.Unlock()
 
 			if fail != nil {
-				if err := fail(req); err != nil {
+				if err := fail(verb, req); err != nil {
 					return nil, err
 				}
 			}
-			payload, err := json.Marshal(reply(req))
+			payload, err := json.Marshal(reply(verb, req))
 			if err != nil {
 				t.Fatalf("marshal reply: %v", err)
 			}
@@ -46,20 +54,20 @@ func newRecordingHook(t *testing.T, rh *recordingHook) *Hook {
 	}
 }
 
-func (rh *recordingHook) seen() []Request {
+func (rh *recordingHook) seen() []seenRequest {
 	rh.mu.Lock()
 	defer rh.mu.Unlock()
-	return append([]Request(nil), rh.requests...)
+	return append([]seenRequest(nil), rh.requests...)
 }
 
-func selectFirstOffered(req Request) Response {
-	if req.Verb == VerbFinish {
-		return Response{Status: statusClosed}
+func selectFirstOffered(verb Verb, req Request) Response {
+	if verb == VerbFinish {
+		return Response{Result: resultClosed, AssignmentID: req.AssignmentID}
 	}
 	if len(req.Routes) == 0 {
-		return Response{Status: statusDeferred, Reason: "nothing offered"}
+		return Response{Result: resultDeferred, Reason: "nothing offered"}
 	}
-	return Response{Status: statusSelected, Route: req.Routes[0], Reason: "fewest-pending"}
+	return Response{Result: resultSelected, RouteID: req.Routes[0], Reason: "fewest-pending"}
 }
 
 func testRouter(t *testing.T, rh *recordingHook, profiles ...Profile) *Router {
@@ -84,7 +92,7 @@ func testRouter(t *testing.T, rh *recordingHook, profiles ...Profile) *Router {
 func TestRouter_NilRouterIsTheUnconfiguredDefault(t *testing.T) {
 	var router *Router
 
-	assignment, selected, err := router.Route(context.Background(), "run-1:1", "review")
+	assignment, selected, err := router.Route(context.Background(), "run-1-launch-1", "review")
 	if err != nil {
 		t.Fatalf("an unconfigured router must not error: %v", err)
 	}
@@ -94,7 +102,7 @@ func TestRouter_NilRouterIsTheUnconfiguredDefault(t *testing.T) {
 	if assignment.ProfileKey() != "" {
 		t.Fatal("an unconfigured router must produce no profile key")
 	}
-	if err := router.Finish(context.Background(), "run-1:1", OutcomeSuccess); err != nil {
+	if err := router.Finish(context.Background(), "run-1-launch-1", OutcomeSuccess); err != nil {
 		t.Fatalf("finishing on an unconfigured router must not error: %v", err)
 	}
 }
@@ -164,18 +172,18 @@ func TestRouter_OffersOnlyTheRolesApprovedProfiles(t *testing.T) {
 	rh := &recordingHook{}
 	router := testRouter(t, rh, fixerOnly, reviewerOnly, codexProfile())
 
-	if _, _, err := router.Route(context.Background(), "run-1:1", "review"); err != nil {
+	if _, _, err := router.Route(context.Background(), "run-1-launch-1", "review"); err != nil {
 		t.Fatalf("route: %v", err)
 	}
-	offered := rh.seen()[0].Routes
+	offered := rh.seen()[0].req.Routes
 	if strings.Join(offered, ",") != "claude-reviewer,codex-sol" {
 		t.Fatalf("review turn was offered %v; the fixer-only route must not appear", offered)
 	}
 
-	if _, _, err := router.Route(context.Background(), "run-1:2", "review-fix"); err != nil {
+	if _, _, err := router.Route(context.Background(), "run-1-launch-2", "review-fix"); err != nil {
 		t.Fatalf("route: %v", err)
 	}
-	offered = rh.seen()[1].Routes
+	offered = rh.seen()[1].req.Routes
 	if strings.Join(offered, ",") != "codex-sol,pi-grok-fixer" {
 		t.Fatalf("fix turn was offered %v; the reviewer-only route must not appear", offered)
 	}
@@ -191,7 +199,7 @@ func TestRouter_RoleWithNothingApprovedIsAConfigurationFault(t *testing.T) {
 	rh := &recordingHook{}
 	router := testRouter(t, rh, fixerOnly)
 
-	_, selected, err := router.Route(context.Background(), "run-1:1", "test-evidence")
+	_, selected, err := router.Route(context.Background(), "run-1-launch-1", "test-evidence")
 	if !errors.Is(err, ErrNoAllowedProfile) {
 		t.Fatalf("error %v must be ErrNoAllowedProfile", err)
 	}
@@ -208,16 +216,16 @@ func TestRouter_RoleWithNothingApprovedIsAConfigurationFault(t *testing.T) {
 // A mis-wired caller therefore cannot bill a route that never ran.
 func TestRouter_FinishReportsTheExactAcquiredIdentity(t *testing.T) {
 	rh := &recordingHook{
-		reply: func(req Request) Response {
-			if req.Verb == VerbFinish {
-				return Response{Status: statusClosed}
+		reply: func(verb Verb, req Request) Response {
+			if verb == VerbFinish {
+				return Response{Result: resultClosed}
 			}
-			return Response{Status: statusSelected, Route: "pi-grok", Reason: "fewest-pending"}
+			return Response{Result: resultSelected, RouteID: "pi-grok", Reason: "fewest-pending"}
 		},
 	}
 	router := testRouter(t, rh, claudeProfile(), piGrokProfile())
 
-	assignment, selected, err := router.Route(context.Background(), "run-1:1", "review-fix")
+	assignment, selected, err := router.Route(context.Background(), "run-1-launch-1", "review-fix")
 	if err != nil || !selected {
 		t.Fatalf("route: %v selected=%v", err, selected)
 	}
@@ -227,17 +235,23 @@ func TestRouter_FinishReportsTheExactAcquiredIdentity(t *testing.T) {
 
 	requests := rh.seen()
 	finish := requests[len(requests)-1]
-	if finish.Verb != VerbFinish {
-		t.Fatalf("last request must be a finish, got %+v", finish)
+	if finish.verb != VerbFinish {
+		t.Fatalf("last call must use the finish subcommand, got %q", finish.verb)
 	}
-	if finish.Assignment != "run-1:1" || finish.Owner != "daemon" || finish.Generation != "gen-1" {
-		t.Fatalf("finish must carry the acquired identity, got %+v", finish)
+	if finish.req.AssignmentID != "run-1-launch-1" {
+		t.Fatalf("finish assignment_id = %q", finish.req.AssignmentID)
 	}
-	if finish.Profile != "pi-grok" {
-		t.Fatalf("finish must name the route that actually ran, got %q", finish.Profile)
+	if finish.req.Owner.Identity != "daemon" || finish.req.Owner.Generation != "gen-1" {
+		t.Fatalf("finish must carry the acquired owner, got %+v", finish.req.Owner)
 	}
-	if finish.Outcome != OutcomeSuccess {
-		t.Fatalf("finish outcome = %q, want success", finish.Outcome)
+	// The concrete identity that ran, not just the route id: the controller
+	// records what was actually spent.
+	if finish.req.Profile == nil || finish.req.Profile.Adapter != "pi" ||
+		finish.req.Profile.Model != "xai/grok-4.6" {
+		t.Fatalf("finish must name the concrete profile that ran, got %+v", finish.req.Profile)
+	}
+	if finish.req.Outcome != OutcomeSuccess {
+		t.Fatalf("finish outcome = %q, want success", finish.req.Outcome)
 	}
 }
 
@@ -249,12 +263,12 @@ func TestRouter_DuplicateAcquisitionAndFinishHaveExplicitOutcomes(t *testing.T) 
 	rh := &recordingHook{}
 	router := testRouter(t, rh, piGrokProfile())
 
-	assignment, _, err := router.Route(context.Background(), "run-1:1", "review-fix")
+	assignment, _, err := router.Route(context.Background(), "run-1-launch-1", "review-fix")
 	if err != nil {
 		t.Fatalf("route: %v", err)
 	}
 
-	if _, _, err := router.Route(context.Background(), "run-1:1", "review-fix"); err == nil ||
+	if _, _, err := router.Route(context.Background(), "run-1-launch-1", "review-fix"); err == nil ||
 		!strings.Contains(err.Error(), "already open") {
 		t.Fatalf("error %v must refuse reacquiring a live assignment", err)
 	}
@@ -270,12 +284,12 @@ func TestRouter_DuplicateAcquisitionAndFinishHaveExplicitOutcomes(t *testing.T) 
 		t.Fatalf("a repeated finish must not reach the hook again (%d then %d requests)", before, after)
 	}
 
-	if _, _, err := router.Route(context.Background(), "run-1:1", "review-fix"); err == nil ||
+	if _, _, err := router.Route(context.Background(), "run-1-launch-1", "review-fix"); err == nil ||
 		!strings.Contains(err.Error(), "already closed") {
 		t.Fatalf("error %v must refuse reopening a spent assignment", err)
 	}
 
-	if err := router.Finish(context.Background(), "run-1:99", OutcomeSuccess); err == nil ||
+	if err := router.Finish(context.Background(), "run-1-launch-99", OutcomeSuccess); err == nil ||
 		!strings.Contains(err.Error(), "never acquired") {
 		t.Fatalf("error %v must refuse finishing an assignment this run never acquired", err)
 	}
@@ -288,19 +302,19 @@ func TestRouter_DuplicateAcquisitionAndFinishHaveExplicitOutcomes(t *testing.T) 
 func TestRouter_DeferredAssignmentIsRetriedNotCached(t *testing.T) {
 	var admit bool
 	rh := &recordingHook{
-		reply: func(req Request) Response {
-			if req.Verb == VerbFinish {
-				return Response{Status: statusClosed}
+		reply: func(verb Verb, req Request) Response {
+			if verb == VerbFinish {
+				return Response{Result: resultClosed}
 			}
 			if !admit {
-				return Response{Status: statusDeferred, Reason: "every candidate route is excluded"}
+				return Response{Result: resultDeferred, Reason: "every candidate route is excluded"}
 			}
-			return Response{Status: statusSelected, Route: req.Routes[0], Reason: "recovered"}
+			return Response{Result: resultSelected, RouteID: req.Routes[0], Reason: "recovered"}
 		},
 	}
 	router := testRouter(t, rh, piGrokProfile())
 
-	_, selected, err := router.Route(context.Background(), "run-1:1", "review-fix")
+	_, selected, err := router.Route(context.Background(), "run-1-launch-1", "review-fix")
 	if !errors.Is(err, ErrDeferred) {
 		t.Fatalf("first attempt must defer, got %v", err)
 	}
@@ -311,7 +325,7 @@ func TestRouter_DeferredAssignmentIsRetriedNotCached(t *testing.T) {
 	// The controller's next refresh admits the route. The SAME assignment id
 	// must be acquirable, because a deferral left nothing recorded to replay.
 	admit = true
-	assignment, selected, err := router.Route(context.Background(), "run-1:1", "review-fix")
+	assignment, selected, err := router.Route(context.Background(), "run-1-launch-1", "review-fix")
 	if err != nil {
 		t.Fatalf("after recovery the same attempt must be admissible: %v", err)
 	}
@@ -328,19 +342,19 @@ func TestRouter_DeferredAssignmentIsRetriedNotCached(t *testing.T) {
 // and the same id stays available for a genuine retry.
 func TestRouter_ARefusedAcquireLeavesNoOpenAssignment(t *testing.T) {
 	rh := &recordingHook{
-		reply: func(req Request) Response {
-			if req.Verb == VerbFinish {
-				return Response{Status: statusClosed}
+		reply: func(verb Verb, req Request) Response {
+			if verb == VerbFinish {
+				return Response{Result: resultClosed}
 			}
-			return Response{Status: statusSelected, Route: "a-route-nobody-offered"}
+			return Response{Result: resultSelected, RouteID: "a-route-nobody-offered"}
 		},
 	}
 	router := testRouter(t, rh, piGrokProfile())
 
-	if _, selected, err := router.Route(context.Background(), "run-1:1", "review-fix"); err == nil || selected {
+	if _, selected, err := router.Route(context.Background(), "run-1-launch-1", "review-fix"); err == nil || selected {
 		t.Fatalf("a disallowed selection must be refused, got selected=%v err=%v", selected, err)
 	}
-	if err := router.Finish(context.Background(), "run-1:1", OutcomeFailed); err == nil ||
+	if err := router.Finish(context.Background(), "run-1-launch-1", OutcomeLaunchFailed); err == nil ||
 		!strings.Contains(err.Error(), "never acquired") {
 		t.Fatalf("error %v must report that nothing was ever acquired", err)
 	}
@@ -349,7 +363,7 @@ func TestRouter_ARefusedAcquireLeavesNoOpenAssignment(t *testing.T) {
 	rh.mu.Lock()
 	rh.reply = selectFirstOffered
 	rh.mu.Unlock()
-	if _, selected, err := router.Route(context.Background(), "run-1:1", "review-fix"); err != nil || !selected {
+	if _, selected, err := router.Route(context.Background(), "run-1-launch-1", "review-fix"); err != nil || !selected {
 		t.Fatalf("the id must remain available after a refusal: selected=%v err=%v", selected, err)
 	}
 }
@@ -403,16 +417,16 @@ func TestRouter_ConcurrentRoutesKeepDistinctAssignments(t *testing.T) {
 // can qualify session reuse without recomputing anything.
 func TestRouter_AssignmentCarriesItsProfileKey(t *testing.T) {
 	rh := &recordingHook{
-		reply: func(req Request) Response {
-			if req.Verb == VerbFinish {
-				return Response{Status: statusClosed}
+		reply: func(verb Verb, req Request) Response {
+			if verb == VerbFinish {
+				return Response{Result: resultClosed}
 			}
-			return Response{Status: statusSelected, Route: "pi-deepseek"}
+			return Response{Result: resultSelected, RouteID: "pi-deepseek"}
 		},
 	}
 	router := testRouter(t, rh, piGrokProfile(), piDeepSeekProfile())
 
-	assignment, _, err := router.Route(context.Background(), "run-1:1", "review-fix")
+	assignment, _, err := router.Route(context.Background(), "run-1-launch-1", "review-fix")
 	if err != nil {
 		t.Fatalf("route: %v", err)
 	}
@@ -425,5 +439,5 @@ func TestRouter_AssignmentCarriesItsProfileKey(t *testing.T) {
 }
 
 func assignmentID(i int) string {
-	return "run-1:" + string(rune('a'+i%26)) + "-" + string(rune('0'+i/26))
+	return fmt.Sprintf("run-1-launch-%d", i)
 }

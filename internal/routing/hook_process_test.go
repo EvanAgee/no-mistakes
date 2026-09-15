@@ -49,21 +49,28 @@ import (
 	"time"
 )
 
+type owner struct {
+	Identity   string ` + "`json:\"identity\"`" + `
+	Generation string ` + "`json:\"generation\"`" + `
+}
+
 type request struct {
-	Verb       string   ` + "`json:\"verb\"`" + `
-	Assignment string   ` + "`json:\"assignment\"`" + `
-	Owner      string   ` + "`json:\"owner\"`" + `
-	Generation string   ` + "`json:\"generation\"`" + `
-	Role       string   ` + "`json:\"role\"`" + `
-	Routes     []string ` + "`json:\"routes\"`" + `
-	Outcome    string   ` + "`json:\"outcome\"`" + `
-	Profile    string   ` + "`json:\"profile\"`" + `
+	AssignmentID string   ` + "`json:\"assignment_id\"`" + `
+	Owner        owner    ` + "`json:\"owner\"`" + `
+	Routes       []string ` + "`json:\"routes\"`" + `
+	Outcome      string   ` + "`json:\"outcome\"`" + `
 }
 
 func main() {
+	// The verb is the subcommand, exactly as the contract specifies.
+	verb := ""
+	if len(os.Args) > 1 {
+		verb = os.Args[len(os.Args)-1]
+	}
+
 	var req request
 	if err := json.NewDecoder(os.Stdin).Decode(&req); err != nil {
-		fmt.Fprintln(os.Stderr, "unreadable request:", err)
+		emit(map[string]any{"result": "error", "error": "unreadable request: " + err.Error()})
 		os.Exit(2)
 	}
 
@@ -73,28 +80,34 @@ func main() {
 		fmt.Print("selected route=", strings.Join(req.Routes, ","))
 		return
 	case "invent-route":
-		emit(map[string]any{"status": "selected", "route": "a-route-nobody-offered"})
+		emit(map[string]any{"result": "selected", "route_id": "a-route-nobody-offered"})
 		return
 	case "hang":
 		time.Sleep(time.Minute)
 		return
 	case "defer":
-		emit(map[string]any{"status": "deferred", "reason": "no route proven eligible"})
+		emit(map[string]any{"result": "deferred", "reason": "no route proven eligible", "generation": 5})
+		return
+	case "already-closed":
+		emit(map[string]any{"result": "already-closed", "reason": "already closed; not relaunched", "generation": 5})
+		return
+	case "refuse":
+		emit(map[string]any{"result": "error", "error": "unknown route id: bogus"})
+		os.Exit(1)
+	}
+
+	if verb == "finish" {
+		appendLine(os.Getenv("FIXTURE_LOG"), "finish "+req.AssignmentID+" "+req.Outcome)
+		emit(map[string]any{"result": "closed", "assignment_id": req.AssignmentID})
 		return
 	}
 
-	if req.Verb == "finish" {
-		appendLine(os.Getenv("FIXTURE_LOG"), "finish "+req.Assignment+" "+req.Outcome+" "+req.Profile)
-		emit(map[string]any{"status": "closed"})
-		return
-	}
-
-	if req.Owner == "" || req.Generation == "" || req.Assignment == "" {
-		fmt.Fprintln(os.Stderr, "incomplete assignment identity")
+	if req.Owner.Identity == "" || req.Owner.Generation == "" || req.AssignmentID == "" {
+		emit(map[string]any{"result": "error", "error": "incomplete assignment identity"})
 		os.Exit(3)
 	}
 	if len(req.Routes) == 0 {
-		fmt.Fprintln(os.Stderr, "no routes offered")
+		emit(map[string]any{"result": "error", "error": "no routes offered"})
 		os.Exit(4)
 	}
 
@@ -102,13 +115,12 @@ func main() {
 	// concurrent callers genuinely contend for the same shared record.
 	n := bumpCounter(os.Getenv("FIXTURE_COUNTER"))
 	route := req.Routes[n%len(req.Routes)]
-	appendLine(os.Getenv("FIXTURE_LOG"), "acquire "+req.Assignment+" "+req.Owner+" "+req.Generation+" "+route)
+	appendLine(os.Getenv("FIXTURE_LOG"), "acquire "+req.AssignmentID+" "+req.Owner.Identity+" "+req.Owner.Generation+" "+route)
 	emit(map[string]any{
-		"status":      "selected",
-		"route":       route,
-		"reason":      "fewest-pending",
-		"generation":  "obs-" + strconv.Itoa(n),
-		"observed_at": time.Now().UTC().Format(time.RFC3339),
+		"result":     "selected",
+		"route_id":   route,
+		"reason":     "fewest-pending",
+		"generation": n,
 	})
 }
 
@@ -231,22 +243,20 @@ func TestHookProcess_RealExecutableSpeaksTheBoundedProtocol(t *testing.T) {
 	if decision.Profile.ID != "claude-opus" && decision.Profile.ID != "pi-grok" {
 		t.Fatalf("selection %q must be one of the offered routes", decision.Profile.ID)
 	}
-	if !decision.Fresh {
-		t.Fatal("the fixture dates its observation, so the decision must read as fresh")
-	}
-
 	if err := hook.Finish(context.Background(), Request{
-		Assignment: "run-1:1", Owner: "daemon", Generation: "gen-1",
-		Outcome: OutcomeSuccess, Profile: decision.Profile.ID,
+		AssignmentID: "run-1-launch-1",
+		Owner:        Owner{Identity: "daemon", Generation: "gen-1"},
+		Outcome:      OutcomeSuccess,
+		Profile:      &LaunchedProfile{Adapter: string(decision.Profile.Agent), Model: decision.Profile.Tuning.Model},
 	}); err != nil {
 		t.Fatalf("finish against a real process: %v", err)
 	}
 
 	logged := readFixtureLog(t, logPath)
-	if !strings.Contains(logged, "acquire run-1:1 daemon gen-1 ") {
+	if !strings.Contains(logged, "acquire run-1-launch-1 daemon gen-1 ") {
 		t.Fatalf("the process must have received the full assignment identity, log:\n%s", logged)
 	}
-	if !strings.Contains(logged, "finish run-1:1 success "+decision.Profile.ID) {
+	if !strings.Contains(logged, "finish run-1-launch-1 success") {
 		t.Fatalf("the process must have received the finish with its route, log:\n%s", logged)
 	}
 }
@@ -277,7 +287,7 @@ func TestHookProcess_ConcurrentAcquiresSpreadAcrossEligibleRoutes(t *testing.T) 
 		go func() {
 			defer wg.Done()
 			req := acquireRequest()
-			req.Assignment = "run-1:" + strconv.Itoa(i)
+			req.AssignmentID = "run-1-launch-" + strconv.Itoa(i)
 			decision, err := hook.Acquire(context.Background(), req, allowed)
 			results[i] = outcome{route: decision.Profile.ID, err: err}
 		}()
@@ -372,7 +382,7 @@ func TestHookProcess_RequestIsNeverAShellToken(t *testing.T) {
 	hostile.ID = "$(touch " + marker + ")"
 
 	req := acquireRequest()
-	req.Assignment = "run-1:`touch " + marker + "`"
+	req.AssignmentID = "run-1-launch-`touch " + marker + "`"
 
 	decision, err := hook.Acquire(context.Background(), req, []Profile{hostile})
 	if err != nil {
@@ -406,5 +416,103 @@ func codexProfile() Profile {
 		Agent:    types.AgentCodex,
 		Provider: "openai-subscription",
 		Tuning:   agentcfg.Profile{Model: "gpt-5.6-sol", Effort: agentcfg.EffortHigh},
+	}
+}
+
+// TestHookProcess_AlreadyClosedFromARealProcessNeverAuthorizes proves the
+// already-closed reply crosses the wire as its own sentinel and carries no
+// route. A relaunch is a new launch with its own assignment id, so the
+// controller deliberately refuses to re-authorize a spent one.
+func TestHookProcess_AlreadyClosedFromARealProcessNeverAuthorizes(t *testing.T) {
+	hook := processHook(t, map[string]string{"FIXTURE_MODE": "already-closed"})
+
+	decision, err := hook.Acquire(context.Background(), acquireRequest(), []Profile{piGrokProfile()})
+	if !errors.Is(err, ErrAlreadyClosed) {
+		t.Fatalf("error = %v, want ErrAlreadyClosed", err)
+	}
+	if decision.Selected {
+		t.Fatalf("an already-closed reply must authorize nothing, got %+v", decision)
+	}
+	if decision.Profile.ID != "" {
+		t.Fatalf("an already-closed reply must resolve no profile, got %q", decision.Profile.ID)
+	}
+}
+
+// TestHookProcess_ControllerRefusalIsReadFromStdoutNotTheExitStatus proves the
+// error object is parsed even though it arrives with a nonzero exit. The
+// controller's own message names what was wrong with the request; "exit status
+// 1" does not.
+func TestHookProcess_ControllerRefusalIsReadFromStdoutNotTheExitStatus(t *testing.T) {
+	hook := processHook(t, map[string]string{"FIXTURE_MODE": "refuse"})
+
+	_, err := hook.Acquire(context.Background(), acquireRequest(), []Profile{piGrokProfile()})
+	if !errors.Is(err, ErrHookRefused) {
+		t.Fatalf("error = %v, want ErrHookRefused", err)
+	}
+	if !strings.Contains(err.Error(), "unknown route id") {
+		t.Fatalf("error %q must carry the controller's own message", err)
+	}
+}
+
+// TestHookProcess_VerbTravelsAsTheSubcommand proves the wire shape: the verb is
+// an argv subcommand, not a request field, exactly as the controller's CLI
+// expects. A fixture that keyed on a request field instead would pass every
+// other test here and fail against the real script.
+func TestHookProcess_VerbTravelsAsTheSubcommand(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "log")
+	hook := processHook(t, map[string]string{
+		"FIXTURE_LOG":     logPath,
+		"FIXTURE_COUNTER": filepath.Join(dir, "counter"),
+	})
+
+	if _, err := hook.Acquire(context.Background(), acquireRequest(), []Profile{piGrokProfile()}); err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	if err := hook.Finish(context.Background(), Request{
+		AssignmentID: "run-1-launch-1",
+		Owner:        Owner{Identity: "daemon", Generation: "gen-1"},
+		Outcome:      OutcomeSuccess,
+	}); err != nil {
+		t.Fatalf("finish: %v", err)
+	}
+
+	// The fixture reads its verb from os.Args and logs accordingly, so these
+	// two lines only appear if the subcommand actually arrived in argv.
+	logged := readFixtureLog(t, logPath)
+	if !strings.Contains(logged, "acquire run-1-launch-1") {
+		t.Fatalf("the acquire subcommand must reach the process, log:\n%s", logged)
+	}
+	if !strings.Contains(logged, "finish run-1-launch-1 success") {
+		t.Fatalf("the finish subcommand must reach the process, log:\n%s", logged)
+	}
+}
+
+// TestHookProcess_EveryNormalizedOutcomeIsAcceptedByTheWire proves the full
+// closed vocabulary round-trips to a real process, including the three values
+// the controller treats as verified evidence against a route.
+func TestHookProcess_EveryNormalizedOutcomeIsAcceptedByTheWire(t *testing.T) {
+	for _, outcome := range []Outcome{
+		OutcomeSuccess, OutcomeLaunchFailed, OutcomeAuthFailed, OutcomeExhausted, OutcomeOutage,
+	} {
+		t.Run(string(outcome), func(t *testing.T) {
+			dir := t.TempDir()
+			logPath := filepath.Join(dir, "log")
+			hook := processHook(t, map[string]string{
+				"FIXTURE_LOG":     logPath,
+				"FIXTURE_COUNTER": filepath.Join(dir, "counter"),
+			})
+
+			if err := hook.Finish(context.Background(), Request{
+				AssignmentID: "run-1-launch-1",
+				Owner:        Owner{Identity: "daemon", Generation: "gen-1"},
+				Outcome:      outcome,
+			}); err != nil {
+				t.Fatalf("finish %s: %v", outcome, err)
+			}
+			if logged := readFixtureLog(t, logPath); !strings.Contains(logged, string(outcome)) {
+				t.Fatalf("the process must receive %q, log:\n%s", outcome, logged)
+			}
+		})
 	}
 }

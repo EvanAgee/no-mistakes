@@ -35,12 +35,6 @@ type Assignment struct {
 	HookArgs []string
 	// HookTimeout bounds one hook call. Zero means routing.DefaultTimeout.
 	HookTimeout time.Duration
-	// MaxEvidenceAge bounds how old the hook's own observation may be before
-	// a selection is logged as made from undatable evidence. Zero disables
-	// the check. It never blocks a launch on its own: the hook owns
-	// eligibility, and second-guessing its verdict here would mean two places
-	// deciding admission.
-	MaxEvidenceAge time.Duration
 	// Profiles are the approved named execution profiles, in configured
 	// order. A hook may select among these by id and nothing else.
 	Profiles []routing.Profile
@@ -59,20 +53,18 @@ func (a Assignment) Hook() *routing.Hook {
 		return nil
 	}
 	return &routing.Hook{
-		Path:           a.HookPath,
-		Args:           append([]string(nil), a.HookArgs...),
-		Timeout:        a.HookTimeout,
-		MaxEvidenceAge: a.MaxEvidenceAge,
+		Path:    a.HookPath,
+		Args:    append([]string(nil), a.HookArgs...),
+		Timeout: a.HookTimeout,
 	}
 }
 
 // assignmentRaw is the on-disk YAML shape.
 type assignmentRaw struct {
-	HookPath       string                 `yaml:"hook_path"`
-	HookArgs       []string               `yaml:"hook_args"`
-	HookTimeout    string                 `yaml:"hook_timeout"`
-	MaxEvidenceAge string                 `yaml:"max_evidence_age"`
-	Profiles       []assignmentProfileRaw `yaml:"profiles"`
+	HookPath    string                 `yaml:"hook_path"`
+	HookArgs    []string               `yaml:"hook_args"`
+	HookTimeout string                 `yaml:"hook_timeout"`
+	Profiles    []assignmentProfileRaw `yaml:"profiles"`
 }
 
 type assignmentProfileRaw struct {
@@ -101,12 +93,6 @@ func parseAssignment(raw assignmentRaw) (Assignment, error) {
 		return Assignment{}, err
 	}
 	out.HookTimeout = timeout
-
-	maxAge, err := parseAssignmentDuration("max_evidence_age", raw.MaxEvidenceAge)
-	if err != nil {
-		return Assignment{}, err
-	}
-	out.MaxEvidenceAge = maxAge
 
 	seen := make(map[string]struct{}, len(raw.Profiles))
 	for i, entry := range raw.Profiles {

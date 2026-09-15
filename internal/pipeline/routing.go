@@ -81,18 +81,37 @@ func (sctx *StepContext) acquireRoute(ctx context.Context, opts *agent.RunOpts, 
 	}
 	r := sctx.Routing
 
-	assignmentID := fmt.Sprintf("%s:%d", r.runID, r.seq.Add(1))
+	// Every launch gets its own assignment id, never a reused one. The
+	// controller treats a repeat id as the SAME launch and replays its record
+	// rather than admitting a new one, so a retry, a fallback to another
+	// adapter and a recovered turn would each be silently refused - or, worse,
+	// counted as work that already happened - if they shared an id.
+	//
+	// The shape mirrors the controller's own relaunch convention
+	// (<task>-relaunch-<generation>): the run identifies the work, and the
+	// monotonic counter identifies which launch attempt within it.
+	assignmentID := fmt.Sprintf("%s-launch-%d", r.runID, r.seq.Add(1))
 	assignment, selected, err := r.router.Route(ctx, assignmentID, opts.Purpose)
 	if err != nil {
-		if errors.Is(err, routing.ErrDeferred) {
+		switch {
+		case errors.Is(err, routing.ErrDeferred):
 			// Not a fault and not permanent: the routing controller admitted
 			// nothing right now. The attempt keeps its own id, so retrying it
 			// after the next refresh is a fresh acquire, not a replay of this
 			// verdict.
 			return nil, false, nil, fmt.Errorf("no approved service is available for this %s invocation right now: %w", opts.Purpose, err)
+		case errors.Is(err, routing.ErrAlreadyClosed):
+			// The controller has already accounted for this exact launch. It
+			// deliberately returns no route, so there is nothing to run; a
+			// genuine relaunch is a new launch with its own id. Reaching this
+			// means the id was reused, which is a fault in this seam rather
+			// than a routing verdict.
+			return nil, false, nil, fmt.Errorf("routing refused to relaunch %s under an assignment that already ran: %w", assignmentID, err)
 		}
 		return nil, false, nil, err
 	}
+	// Belt and braces: only a selected decision authorizes a launch, and a
+	// decision that is not selected must never reach the adapter factory.
 	if !selected {
 		return nil, false, nil, nil
 	}
@@ -125,7 +144,7 @@ func (sctx *StepContext) acquireRoute(ctx context.Context, opts *agent.RunOpts, 
 		// real outcome first, and finish is idempotent, so this only fires on
 		// a path that skipped it - a panic unwinding through the seam. Such a
 		// turn did launch, so "failed" is the honest report.
-		r.finish(context.WithoutCancel(ctx), invocation, routing.OutcomeFailed)
+		r.finish(context.WithoutCancel(ctx), invocation, routing.OutcomeLaunchFailed)
 	}
 	return invocation, true, release, nil
 }
@@ -133,22 +152,38 @@ func (sctx *StepContext) acquireRoute(ctx context.Context, opts *agent.RunOpts, 
 // recordRouteOutcome reports the invocation's normalized result. It runs on
 // every path - success, failure, timeout, cancellation - because an assignment
 // the controller never sees closed is one it keeps counting as running.
-//
-// The outcome is derived from the error alone. What the turn produced is the
-// pipeline's business; all the controller needs to know is whether this route
-// finished serving the work it was assigned.
 func (sctx *StepContext) recordRouteOutcome(invocation *routedInvocation, err error) {
 	if sctx == nil || sctx.Routing == nil || invocation == nil {
 		return
 	}
-	outcome := routing.OutcomeSuccess
-	if err != nil {
-		outcome = routing.OutcomeFailed
-	}
 	// Finish must survive a cancelled invocation: the turn has already
 	// happened, and reporting it through the dead context would drop the
 	// record precisely when the controller most needs it.
-	sctx.Routing.finish(context.WithoutCancel(sctx.routingContext()), invocation, outcome)
+	sctx.Routing.finish(context.WithoutCancel(sctx.routingContext()), invocation, classifyRouteOutcome(err))
+}
+
+// classifyRouteOutcome maps an invocation's error to the controller's closed
+// outcome vocabulary.
+//
+// The mapping is deliberately conservative, because three of those values are
+// not status reports: `auth-failed`, `exhausted` and `outage` are verified
+// evidence AGAINST the route, and the controller excludes it immediately on
+// receiving one, before its own next probe. Reporting one on a guess would
+// take a healthy service out of the pool for every other caller on this
+// machine, on nothing more than one failed turn.
+//
+// no-mistakes cannot establish any of those three conditions from this seam.
+// It sees that an invocation failed, not why the provider refused it, and an
+// adapter error quoting a provider's prose is not proof: a prompt can contain
+// the words too. So a failed turn reports `launch-failed`, which releases the
+// assignment honestly without condemning the route. If this seam ever gains a
+// real signal - an adapter that reports a structured auth or quota refusal -
+// that is where the stronger values belong, and nowhere else.
+func classifyRouteOutcome(err error) routing.Outcome {
+	if err == nil {
+		return routing.OutcomeSuccess
+	}
+	return routing.OutcomeLaunchFailed
 }
 
 func (sctx *StepContext) routingContext() context.Context {
@@ -179,8 +214,8 @@ func describeReason(a routing.Assignment) string {
 	if reason == "" {
 		reason = "no reason reported"
 	}
-	if !a.Fresh {
-		return reason + " (from evidence the controller could not date as current)"
+	if a.Generation > 0 {
+		return fmt.Sprintf("%s (controller generation %d)", reason, a.Generation)
 	}
 	return reason
 }

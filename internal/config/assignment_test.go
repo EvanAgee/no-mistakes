@@ -44,7 +44,6 @@ assignment:
   hook_path: /opt/firstmate/bin/fm-route
   hook_args: ["--json"]
   hook_timeout: 15s
-  max_evidence_age: 10m
   profiles:
     - id: claude-opus
       agent: claude
@@ -84,9 +83,6 @@ assignment:
 	if cfg.Assignment.HookTimeout != 15*time.Second {
 		t.Fatalf("hook timeout = %v", cfg.Assignment.HookTimeout)
 	}
-	if cfg.Assignment.MaxEvidenceAge != 10*time.Minute {
-		t.Fatalf("max evidence age = %v", cfg.Assignment.MaxEvidenceAge)
-	}
 
 	if len(cfg.Assignment.Profiles) != 4 {
 		t.Fatalf("want 4 profiles, got %d", len(cfg.Assignment.Profiles))
@@ -108,8 +104,8 @@ assignment:
 	if hook == nil || hook.Path != cfg.Assignment.HookPath {
 		t.Fatalf("hook = %+v", hook)
 	}
-	if hook.Timeout != 15*time.Second || hook.MaxEvidenceAge != 10*time.Minute {
-		t.Fatalf("hook bounds = %+v", hook)
+	if hook.Timeout != 15*time.Second {
+		t.Fatalf("hook timeout = %v", hook.Timeout)
 	}
 }
 
@@ -207,10 +203,10 @@ func TestAssignment_RefusesWhatCouldNotBeLaunched(t *testing.T) {
 			wantMsg: "invalid assignment.hook_timeout",
 		},
 		{
-			name: "negative evidence age",
+			name: "negative timeout",
 			yaml: `assignment:
   hook_path: /bin/route
-  max_evidence_age: -5m
+  hook_timeout: -5m
   profiles:
     - id: claude-opus
       agent: claude

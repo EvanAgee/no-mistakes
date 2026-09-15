@@ -23,26 +23,32 @@ import (
 // routing failure never launches anything, and nothing already running is
 // disturbed by a later invocation choosing a different service.
 
-// fakeHookTransport drives routing.Hook without a process, recording every
-// request so a test can assert exactly what the controller was told.
-type fakeHookTransport struct {
-	mu       sync.Mutex
-	requests []routing.Request
-	reply    func(routing.Request) routing.Response
-	fail     func(routing.Request) error
+// seenCall is one hook call: the subcommand plus its JSON payload.
+type seenCall struct {
+	verb routing.Verb
+	req  routing.Request
 }
 
-func (f *fakeHookTransport) seen() []routing.Request {
+// fakeHookTransport drives routing.Hook without a process, recording every
+// call so a test can assert exactly what the controller was told.
+type fakeHookTransport struct {
+	mu       sync.Mutex
+	requests []seenCall
+	reply    func(routing.Verb, routing.Request) routing.Response
+	fail     func(routing.Verb, routing.Request) error
+}
+
+func (f *fakeHookTransport) seen() []seenCall {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return append([]routing.Request(nil), f.requests...)
+	return append([]seenCall(nil), f.requests...)
 }
 
 func (f *fakeHookTransport) finishes() []routing.Request {
 	var out []routing.Request
-	for _, req := range f.seen() {
-		if req.Verb == routing.VerbFinish {
-			out = append(out, req)
+	for _, call := range f.seen() {
+		if call.verb == routing.VerbFinish {
+			out = append(out, call.req)
 		}
 	}
 	return out
@@ -54,22 +60,22 @@ func testRouting(t *testing.T, transport *fakeHookTransport, profiles []routing.
 	newAgent func(routing.Profile) (agent.Agent, error)) *RunRouting {
 	t.Helper()
 
-	hook := routing.NewTestHook(func(_ context.Context, stdin []byte) ([]byte, error) {
+	hook := routing.NewTestHook(func(_ context.Context, verb routing.Verb, stdin []byte) ([]byte, error) {
 		var req routing.Request
 		if err := json.Unmarshal(stdin, &req); err != nil {
 			t.Fatalf("unreadable request: %v", err)
 		}
 		transport.mu.Lock()
-		transport.requests = append(transport.requests, req)
+		transport.requests = append(transport.requests, seenCall{verb: verb, req: req})
 		fail, reply := transport.fail, transport.reply
 		transport.mu.Unlock()
 
 		if fail != nil {
-			if err := fail(req); err != nil {
+			if err := fail(verb, req); err != nil {
 				return nil, err
 			}
 		}
-		payload, err := json.Marshal(reply(req))
+		payload, err := json.Marshal(reply(verb, req))
 		if err != nil {
 			t.Fatalf("marshal reply: %v", err)
 		}
@@ -83,12 +89,12 @@ func testRouting(t *testing.T, transport *fakeHookTransport, profiles []routing.
 	return NewRunRouting(router, "run-1", newAgent)
 }
 
-func selectByID(id string) func(routing.Request) routing.Response {
-	return func(req routing.Request) routing.Response {
-		if req.Verb == routing.VerbFinish {
-			return routing.Response{Status: "closed"}
+func selectByID(id string) func(routing.Verb, routing.Request) routing.Response {
+	return func(verb routing.Verb, req routing.Request) routing.Response {
+		if verb == routing.VerbFinish {
+			return routing.Response{Result: "closed", AssignmentID: req.AssignmentID}
 		}
-		return routing.Response{Status: "selected", Route: id, Reason: "fewest-pending"}
+		return routing.Response{Result: "selected", RouteID: id, Reason: "fewest-pending"}
 	}
 }
 
@@ -188,16 +194,18 @@ func TestRunAgent_RoutedInvocationLaunchesTheSelectedProfileAndReportsIt(t *test
 
 	requests := transport.seen()
 	if len(requests) != 2 {
-		t.Fatalf("want an acquire then a finish, got %d requests", len(requests))
+		t.Fatalf("want an acquire then a finish, got %d calls", len(requests))
 	}
-	if requests[0].Verb != routing.VerbAcquire || requests[0].Role != "review-fix" {
-		t.Fatalf("the first request must acquire for this role, got %+v", requests[0])
+	if requests[0].verb != routing.VerbAcquire {
+		t.Fatalf("the first call must be an acquire, got %q", requests[0].verb)
 	}
-	if requests[1].Verb != routing.VerbFinish || requests[1].Outcome != routing.OutcomeSuccess {
-		t.Fatalf("the second request must report success, got %+v", requests[1])
+	if requests[1].verb != routing.VerbFinish || requests[1].req.Outcome != routing.OutcomeSuccess {
+		t.Fatalf("the second call must report success, got %q %+v", requests[1].verb, requests[1].req)
 	}
-	if requests[1].Profile != routingPiGrokProfile().ID {
-		t.Fatalf("finish must name the profile that ran, got %q", requests[1].Profile)
+	if requests[1].req.Profile == nil ||
+		requests[1].req.Profile.Adapter != string(routingPiGrokProfile().Agent) ||
+		requests[1].req.Profile.Model != routingPiGrokProfile().Tuning.Model {
+		t.Fatalf("finish must name the concrete profile that ran, got %+v", requests[1].req.Profile)
 	}
 
 	// Every launch records the effective provider and model, and the selection
@@ -217,29 +225,29 @@ func TestRunAgent_RoutedInvocationLaunchesTheSelectedProfileAndReportsIt(t *test
 func TestRunAgent_RoutingFailureNeverLaunchesAnExcludedRoute(t *testing.T) {
 	cases := []struct {
 		name    string
-		reply   func(routing.Request) routing.Response
-		fail    func(routing.Request) error
+		reply   func(routing.Verb, routing.Request) routing.Response
+		fail    func(routing.Verb, routing.Request) error
 		wantMsg string
 	}{
 		{
 			name: "deferred",
-			reply: func(routing.Request) routing.Response {
-				return routing.Response{Status: "deferred", Reason: "every candidate route is excluded"}
+			reply: func(routing.Verb, routing.Request) routing.Response {
+				return routing.Response{Result: "deferred", Reason: "every candidate route is excluded"}
 			},
 			wantMsg: "no approved service is available",
 		},
 		{
 			name: "route nobody offered",
-			reply: func(routing.Request) routing.Response {
-				return routing.Response{Status: "selected", Route: "a-route-nobody-offered"}
+			reply: func(routing.Verb, routing.Request) routing.Response {
+				return routing.Response{Result: "selected", RouteID: "a-route-nobody-offered"}
 			},
 			wantMsg: "not among the",
 		},
 		{
 			name:  "hook fault",
 			reply: selectByID(routingPiGrokProfile().ID),
-			fail: func(req routing.Request) error {
-				if req.Verb == routing.VerbAcquire {
+			fail: func(verb routing.Verb, _ routing.Request) error {
+				if verb == routing.VerbAcquire {
 					return errors.New("exit status 1")
 				}
 				return nil
@@ -283,8 +291,8 @@ func TestRunAgent_RoutingFailureNeverLaunchesAnExcludedRoute(t *testing.T) {
 // the next refresh" from "this is broken".
 func TestRunAgent_DeferredInvocationStaysRetryable(t *testing.T) {
 	transport := &fakeHookTransport{
-		reply: func(routing.Request) routing.Response {
-			return routing.Response{Status: "deferred", Reason: "no route proven eligible"}
+		reply: func(routing.Verb, routing.Request) routing.Response {
+			return routing.Response{Result: "deferred", Reason: "no route proven eligible"}
 		},
 	}
 	run := testRouting(t, transport, []routing.Profile{routingPiGrokProfile()},
@@ -376,8 +384,8 @@ func TestRunAgent_FailureAndTimeoutAreReportedAsFailed(t *testing.T) {
 			if len(finishes) != 1 {
 				t.Fatalf("want exactly one finish, got %d", len(finishes))
 			}
-			if finishes[0].Outcome != routing.OutcomeFailed {
-				t.Fatalf("outcome = %q, want %q", finishes[0].Outcome, routing.OutcomeFailed)
+			if finishes[0].Outcome != routing.OutcomeLaunchFailed {
+				t.Fatalf("outcome = %q, want %q", finishes[0].Outcome, routing.OutcomeLaunchFailed)
 			}
 		})
 	}
@@ -422,13 +430,13 @@ func TestRunAgent_EachInvocationIsItsOwnAssignment(t *testing.T) {
 	order := []string{routingClaudeProfile().ID, routingCodexProfile().ID, routingPiGrokProfile().ID, routingPiDeepSeekProfile().ID}
 	var turn int
 	transport := &fakeHookTransport{
-		reply: func(req routing.Request) routing.Response {
-			if req.Verb == routing.VerbFinish {
-				return routing.Response{Status: "closed"}
+		reply: func(verb routing.Verb, req routing.Request) routing.Response {
+			if verb == routing.VerbFinish {
+				return routing.Response{Result: "closed"}
 			}
 			route := order[turn%len(order)]
 			turn++
-			return routing.Response{Status: "selected", Route: route, Reason: "fewest-pending"}
+			return routing.Response{Result: "selected", RouteID: route, Reason: "fewest-pending"}
 		},
 	}
 	profiles := []routing.Profile{
@@ -455,14 +463,14 @@ func TestRunAgent_EachInvocationIsItsOwnAssignment(t *testing.T) {
 	}
 
 	ids := map[string]bool{}
-	for _, req := range transport.seen() {
-		if req.Verb != routing.VerbAcquire {
+	for _, call := range transport.seen() {
+		if call.verb != routing.VerbAcquire {
 			continue
 		}
-		if ids[req.Assignment] {
-			t.Fatalf("assignment %q was acquired twice", req.Assignment)
+		if ids[call.req.AssignmentID] {
+			t.Fatalf("assignment %q was acquired twice", call.req.AssignmentID)
 		}
-		ids[req.Assignment] = true
+		ids[call.req.AssignmentID] = true
 	}
 	if len(ids) != len(order) {
 		t.Fatalf("want %d distinct assignments, got %d", len(order), len(ids))
@@ -519,7 +527,7 @@ func TestRunAgent_RoleRestrictionReachesTheController(t *testing.T) {
 		t.Fatalf("run: %v", err)
 	}
 
-	offered := transport.seen()[0].Routes
+	offered := transport.seen()[0].req.Routes
 	if strings.Join(offered, ",") != reviewerOnly.ID {
 		t.Fatalf("a review turn must be offered only %q, got %v", reviewerOnly.ID, offered)
 	}
@@ -619,8 +627,8 @@ func TestRunAgent_PanicStillReleasesTheAssignment(t *testing.T) {
 	if len(finishes) != 1 {
 		t.Fatalf("a panicking invocation must still release its assignment, got %d finishes", len(finishes))
 	}
-	if finishes[0].Outcome != routing.OutcomeFailed {
-		t.Fatalf("outcome = %q, want %q", finishes[0].Outcome, routing.OutcomeFailed)
+	if finishes[0].Outcome != routing.OutcomeLaunchFailed {
+		t.Fatalf("outcome = %q, want %q", finishes[0].Outcome, routing.OutcomeLaunchFailed)
 	}
 }
 
@@ -643,5 +651,178 @@ func TestRunAgent_NormalOutcomeWinsOverTheBackstop(t *testing.T) {
 	}
 	if finishes[0].Outcome != routing.OutcomeSuccess {
 		t.Fatalf("outcome = %q, want %q", finishes[0].Outcome, routing.OutcomeSuccess)
+	}
+}
+
+// TestRunAgent_AlreadyClosedAssignmentNeverLaunches proves the controller's
+// already-closed reply stops the turn. That reply means this exact launch has
+// already run and been accounted for, and it deliberately carries no route, so
+// treating it as authorization would both double-count the work and have
+// nothing to run.
+func TestRunAgent_AlreadyClosedAssignmentNeverLaunches(t *testing.T) {
+	var built []string
+	transport := &fakeHookTransport{
+		reply: func(routing.Verb, routing.Request) routing.Response {
+			return routing.Response{
+				Result: "already-closed",
+				Reason: "already closed; not relaunched",
+			}
+		},
+	}
+	run := testRouting(t, transport, []routing.Profile{routingPiGrokProfile()},
+		func(p routing.Profile) (agent.Agent, error) {
+			built = append(built, p.ID)
+			return &recordingAgent{profile: p}, nil
+		})
+
+	configured := &hangingAgent{name: "configured"}
+	sctx := &StepContext{Ctx: context.Background(), Agent: configured, Routing: run}
+
+	_, err := sctx.RunAgent(agent.RunOpts{Prompt: "fix", Purpose: "review-fix"})
+	if !errors.Is(err, routing.ErrAlreadyClosed) {
+		t.Fatalf("error = %v, want ErrAlreadyClosed", err)
+	}
+	if len(built) != 0 {
+		t.Fatalf("an already-closed assignment must build no adapter, built %v", built)
+	}
+	if configured.calls != 0 {
+		t.Fatal("an already-closed assignment must not fall back to the configured agent")
+	}
+	if len(transport.finishes()) != 0 {
+		t.Fatal("nothing was admitted, so nothing may be finished")
+	}
+}
+
+// TestRunAgent_OnlySelectedAuthorizesALaunch is the rule stated directly. Each
+// row is a reply that is not `selected`, and none of them may start a process,
+// however plausible the rest of the reply looks.
+func TestRunAgent_OnlySelectedAuthorizesALaunch(t *testing.T) {
+	cases := []struct {
+		name  string
+		reply routing.Response
+	}{
+		{"deferred", routing.Response{Result: "deferred", Reason: "no route proven eligible"}},
+		{"already-closed", routing.Response{Result: "already-closed", Reason: "already closed"}},
+		{
+			name:  "already-closed carrying a real route id",
+			reply: routing.Response{Result: "already-closed", RouteID: routingPiGrokProfile().ID},
+		},
+		{"controller error object", routing.Response{Result: "error", Error: "unknown route id"}},
+		{"a result nobody defined", routing.Response{Result: "approved", RouteID: routingPiGrokProfile().ID}},
+		{"empty result", routing.Response{RouteID: routingPiGrokProfile().ID}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var built []string
+			transport := &fakeHookTransport{
+				reply: func(routing.Verb, routing.Request) routing.Response { return tc.reply },
+			}
+			run := testRouting(t, transport, []routing.Profile{routingPiGrokProfile()},
+				func(p routing.Profile) (agent.Agent, error) {
+					built = append(built, p.ID)
+					return &recordingAgent{profile: p}, nil
+				})
+
+			configured := &hangingAgent{name: "configured"}
+			sctx := &StepContext{Ctx: context.Background(), Agent: configured, Routing: run}
+
+			if _, err := sctx.RunAgent(agent.RunOpts{Prompt: "fix", Purpose: "review-fix"}); err == nil {
+				t.Fatal("a reply that is not selected must fail the invocation")
+			}
+			if len(built) != 0 {
+				t.Fatalf("no adapter may be built, built %v", built)
+			}
+			if configured.calls != 0 {
+				t.Fatal("the configured agent must not serve the turn either")
+			}
+		})
+	}
+}
+
+// TestRunAgent_EveryLaunchUsesItsOwnAssignmentID proves ids are never reused.
+// The controller treats a repeat id as the same launch and replays its record,
+// so a reused id would either be refused or, worse, silently counted as work
+// that already happened. The shape also carries the run and the attempt number,
+// mirroring the controller's own relaunch convention.
+func TestRunAgent_EveryLaunchUsesItsOwnAssignmentID(t *testing.T) {
+	transport := &fakeHookTransport{reply: selectByID(routingPiGrokProfile().ID)}
+	run := testRouting(t, transport, []routing.Profile{routingPiGrokProfile()},
+		func(p routing.Profile) (agent.Agent, error) { return &recordingAgent{profile: p}, nil })
+
+	sctx := &StepContext{Ctx: context.Background(), Agent: &hangingAgent{name: "configured"}, Routing: run}
+	const launches = 4
+	for i := range launches {
+		if _, err := sctx.RunAgent(agent.RunOpts{
+			Prompt: fmt.Sprintf("fix round %d", i+1), Purpose: "review-fix",
+		}); err != nil {
+			t.Fatalf("launch %d: %v", i+1, err)
+		}
+	}
+
+	seen := map[string]bool{}
+	for _, call := range transport.seen() {
+		if call.verb != routing.VerbAcquire {
+			continue
+		}
+		id := call.req.AssignmentID
+		if seen[id] {
+			t.Fatalf("assignment id %q was used for two launches", id)
+		}
+		seen[id] = true
+		if !strings.HasPrefix(id, "run-1-launch-") {
+			t.Fatalf("assignment id %q must name the run and the launch attempt", id)
+		}
+	}
+	if len(seen) != launches {
+		t.Fatalf("want %d distinct assignment ids, got %d", launches, len(seen))
+	}
+}
+
+// TestRunAgent_OwnerIdentityAndGenerationReachTheController proves both halves
+// travel. Identity is what lets the controller recognize a repeat as the same
+// launch; generation is what lets it tell a live owner from one that was torn
+// down, so a dead incarnation's assignments stop being counted against a route.
+func TestRunAgent_OwnerIdentityAndGenerationReachTheController(t *testing.T) {
+	transport := &fakeHookTransport{reply: selectByID(routingPiGrokProfile().ID)}
+	run := testRouting(t, transport, []routing.Profile{routingPiGrokProfile()},
+		func(p routing.Profile) (agent.Agent, error) { return &recordingAgent{profile: p}, nil })
+
+	sctx := &StepContext{Ctx: context.Background(), Agent: &hangingAgent{name: "configured"}, Routing: run}
+	if _, err := sctx.RunAgent(agent.RunOpts{Prompt: "fix", Purpose: "review-fix"}); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	acquire := transport.seen()[0]
+	if acquire.req.Owner.Identity != "daemon" {
+		t.Fatalf("owner identity = %q, want daemon", acquire.req.Owner.Identity)
+	}
+	if acquire.req.Owner.Generation != "gen-1" {
+		t.Fatalf("owner generation = %q, want gen-1", acquire.req.Owner.Generation)
+	}
+}
+
+// TestClassifyRouteOutcome_NeverGuessesRouteEvidence pins the conservative
+// mapping. Three of the controller's outcome values are verified evidence
+// against the route and exclude it immediately for every caller on this
+// machine. no-mistakes cannot establish any of them from this seam, so a failed
+// turn reports launch-failed instead of condemning a service on one bad turn.
+func TestClassifyRouteOutcome_NeverGuessesRouteEvidence(t *testing.T) {
+	if got := classifyRouteOutcome(nil); got != routing.OutcomeSuccess {
+		t.Fatalf("a completed turn = %q, want success", got)
+	}
+
+	for _, err := range []error{
+		errors.New("structured output rejected"),
+		errors.New("401 unauthorized: invalid api key"),
+		errors.New("429 rate limit exceeded, quota exhausted"),
+		errors.New("503 service unavailable"),
+		context.DeadlineExceeded,
+		context.Canceled,
+	} {
+		got := classifyRouteOutcome(err)
+		if got != routing.OutcomeLaunchFailed {
+			t.Fatalf("error %q classified as %q; only a verified signal may report route evidence", err, got)
+		}
 	}
 }

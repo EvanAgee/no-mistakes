@@ -76,11 +76,12 @@ func NewRouter(hook *Hook, profiles []Profile, owner, generation string) (*Route
 // Assignment is one admitted invocation. Finish must be called for every
 // Assignment that Route returns, whatever happens to the invocation.
 type Assignment struct {
-	ID         string
-	Profile    Profile
-	Reason     string
-	Fresh      bool
-	Generation string
+	ID      string
+	Profile Profile
+	Reason  string
+	// Generation is the controller ledger's own decision generation behind
+	// this selection, for the operator's log.
+	Generation int64
 }
 
 // ProfileKey is the session-reuse identity of the assigned profile.
@@ -126,14 +127,16 @@ func (r *Router) Route(ctx context.Context, assignmentID, role string) (Assignme
 	}
 
 	decision, err := r.hook.Acquire(ctx, Request{
-		Assignment: assignmentID,
-		Owner:      r.owner,
-		Generation: r.generation,
-		Role:       role,
+		AssignmentID: assignmentID,
+		Owner:        Owner{Identity: r.owner, Generation: r.generation},
 	}, allowed)
 	if err != nil {
-		// A deferred attempt is not remembered as closed: the next refresh may
-		// admit the same work, and caching the verdict would strand it.
+		// Nothing was admitted, so nothing is recorded locally. A deferral in
+		// particular must not be remembered as closed: the next refresh may
+		// admit the same work, and caching the verdict would strand it. The
+		// other refusals (already-closed, a controller error, an unoffered
+		// route) leave the id untouched too, so a corrected retry is a fresh
+		// acquire rather than a replay.
 		return Assignment{}, false, err
 	}
 
@@ -145,7 +148,6 @@ func (r *Router) Route(ctx context.Context, assignmentID, role string) (Assignme
 		ID:         assignmentID,
 		Profile:    decision.Profile,
 		Reason:     decision.Reason,
-		Fresh:      decision.Fresh,
 		Generation: decision.Generation,
 	}, true, nil
 }
@@ -180,11 +182,18 @@ func (r *Router) Finish(ctx context.Context, assignmentID string, outcome Outcom
 	r.mu.Unlock()
 
 	return r.hook.Finish(ctx, Request{
-		Assignment: assignmentID,
-		Owner:      r.owner,
-		Generation: r.generation,
-		Outcome:    outcome,
-		Profile:    profile.ID,
+		AssignmentID: assignmentID,
+		Owner:        Owner{Identity: r.owner, Generation: r.generation},
+		Outcome:      outcome,
+		// The concrete identity that actually launched, so the controller
+		// records what was really spent rather than only which route it
+		// admitted. Nonsecret by construction: these are the operator's own
+		// declared values, never a credential or an account selection.
+		Profile: &LaunchedProfile{
+			Adapter: string(profile.Agent),
+			Model:   profile.Tuning.Model,
+			Effort:  string(profile.Tuning.Effort),
+		},
 	})
 }
 
