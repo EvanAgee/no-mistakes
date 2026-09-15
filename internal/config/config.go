@@ -157,6 +157,12 @@ type GlobalConfig struct {
 	// ReviewAgents selects independent review-loop harnesses and profiles.
 	// Global-only: repository input must not select credential/model profiles.
 	ReviewAgents map[string]ReviewAgent `yaml:"review_agents"`
+	// Assignment is continuous routing: which approved native profile serves
+	// each agent invocation, decided per invocation by an operator-configured
+	// hook. Global-only for the same reason as agent_config: it decides which
+	// process launches with this machine's credentials, against which
+	// subscription. Unset means routing is off and nothing about a run changes.
+	Assignment Assignment `yaml:"-"`
 	// WorktreeRoots places a repository's pipeline run worktrees under a
 	// directory the operator chose instead of the default
 	// <NM_HOME>/worktrees/<repoID>. Keys are registered checkout paths
@@ -216,6 +222,7 @@ type globalConfigRaw struct {
 	AgentArgsOverride       map[string][]string        `yaml:"agent_args_override"`
 	AgentConfig             map[string]agentProfileRaw `yaml:"agent_config"`
 	ReviewAgents            map[string]ReviewAgent     `yaml:"review_agents"`
+	Assignment              assignmentRaw              `yaml:"assignment"`
 	WorktreeRoots           map[string]string          `yaml:"worktree_roots"`
 	CITimeout               string                     `yaml:"ci_timeout"`
 	DaemonConnectTimeout    string                     `yaml:"daemon_connect_timeout"`
@@ -653,6 +660,9 @@ type Config struct {
 	AgentArgsOverride     map[string][]string
 	AgentConfig           map[string]agentcfg.Profile
 	ReviewAgents          map[string]ReviewAgent
+	// Assignment is the operator's continuous-routing setting, carried from
+	// global configuration only. A repository never contributes to it.
+	Assignment            Assignment
 	CITimeout             time.Duration
 	StepQuietWarning      time.Duration
 	AgentTimeout          time.Duration
@@ -2097,6 +2107,11 @@ func LoadGlobalFromBytes(data []byte) (*GlobalConfig, error) {
 		return nil, err
 	}
 	cfg.ReviewAgents = raw.ReviewAgents
+	assignment, err := parseAssignment(raw.Assignment)
+	if err != nil {
+		return nil, err
+	}
+	cfg.Assignment = assignment
 	if raw.WorktreeRoots != nil {
 		if err := ValidateWorktreeRoots(raw.WorktreeRoots); err != nil {
 			return nil, err
@@ -3004,6 +3019,7 @@ func Merge(global *GlobalConfig, repo *RepoConfig) *Config {
 		AgentArgsOverride:     global.AgentArgsOverride,
 		AgentConfig:           global.AgentConfig,
 		ReviewAgents:          global.ReviewAgents,
+		Assignment:            global.Assignment,
 		CITimeout:             global.CITimeout,
 		StepQuietWarning:      global.StepQuietWarning,
 		AgentTimeout:          global.AgentTimeout,

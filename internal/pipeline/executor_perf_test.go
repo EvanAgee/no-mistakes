@@ -10,6 +10,7 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/agent"
 	"github.com/kunchenguid/no-mistakes/internal/config"
 	"github.com/kunchenguid/no-mistakes/internal/db"
+	"github.com/kunchenguid/no-mistakes/internal/routing"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
 
@@ -167,7 +168,7 @@ func TestPerfRecordingAgent_MixedFallbackRecordsActualProviderCold(t *testing.T)
 	}
 
 	sessions := NewRunSessions(database, run.ID, wrapped, true)
-	if _, err := sessions.Run(context.Background(), wrapped, SessionRoleReviewer, agent.RunOpts{Purpose: "review"}, nil); err != nil {
+	if _, err := sessions.Run(context.Background(), wrapped, SessionRoleReviewer, routing.UnroutedProfileKey, agent.RunOpts{Purpose: "review"}, nil); err != nil {
 		t.Fatalf("run session: %v", err)
 	}
 

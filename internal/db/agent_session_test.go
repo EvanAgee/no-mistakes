@@ -26,10 +26,10 @@ func openSessionTestDB(t *testing.T) (*DB, *Repo, *Run) {
 func TestRunAgentSessions_UpsertGetDelete(t *testing.T) {
 	d, _, run := openSessionTestDB(t)
 
-	if err := d.UpsertRunAgentSession(run.ID, "reviewer", "codex", "thread-1"); err != nil {
+	if err := d.UpsertRunAgentSession(run.ID, "reviewer", "codex", "thread-1", ""); err != nil {
 		t.Fatalf("upsert: %v", err)
 	}
-	if err := d.UpsertRunAgentSession(run.ID, "review-fixer", "codex", "thread-2"); err != nil {
+	if err := d.UpsertRunAgentSession(run.ID, "review-fixer", "codex", "thread-2", ""); err != nil {
 		t.Fatalf("upsert fixer: %v", err)
 	}
 
@@ -49,7 +49,7 @@ func TestRunAgentSessions_UpsertGetDelete(t *testing.T) {
 	}
 
 	// Upsert replaces the same role's identity instead of adding a row.
-	if err := d.UpsertRunAgentSession(run.ID, "reviewer", "codex", "thread-3"); err != nil {
+	if err := d.UpsertRunAgentSession(run.ID, "reviewer", "codex", "thread-3", ""); err != nil {
 		t.Fatalf("re-upsert: %v", err)
 	}
 	sessions, err = d.GetRunAgentSessions(run.ID)
@@ -81,10 +81,10 @@ func TestRunAgentSessions_IsolatedPerRun(t *testing.T) {
 		t.Fatalf("insert run2: %v", err)
 	}
 
-	if err := d.UpsertRunAgentSession(run1.ID, "reviewer", "codex", "thread-run1"); err != nil {
+	if err := d.UpsertRunAgentSession(run1.ID, "reviewer", "codex", "thread-run1", ""); err != nil {
 		t.Fatalf("upsert run1: %v", err)
 	}
-	if err := d.UpsertRunAgentSession(run2.ID, "reviewer", "codex", "thread-run2"); err != nil {
+	if err := d.UpsertRunAgentSession(run2.ID, "reviewer", "codex", "thread-run2", ""); err != nil {
 		t.Fatalf("upsert run2: %v", err)
 	}
 
@@ -125,7 +125,7 @@ func TestOpenMigratesRunAgentSessionsTable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("insert run: %v", err)
 	}
-	if err := d.UpsertRunAgentSession(run.ID, "reviewer", "claude", "sess"); err != nil {
+	if err := d.UpsertRunAgentSession(run.ID, "reviewer", "claude", "sess", ""); err != nil {
 		t.Fatalf("upsert after migration: %v", err)
 	}
 }

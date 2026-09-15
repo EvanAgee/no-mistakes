@@ -332,7 +332,7 @@ func TestReviewFixerSession_FreshFallbackTimeoutExcludesResumeActivity(t *testin
 	sctx.Config.SessionReuse = true
 	sctx.Fixing = true
 	sctx.PreviousFindings = `{"findings":[{"id":"f-1","severity":"error","description":"fix this","action":"auto-fix"}]}`
-	if err := sctx.DB.UpsertRunAgentSession(sctx.Run.ID, string(pipeline.SessionRoleFixer), ag.Name(), "stale-session"); err != nil {
+	if err := sctx.DB.UpsertRunAgentSession(sctx.Run.ID, string(pipeline.SessionRoleFixer), ag.Name(), "stale-session", ""); err != nil {
 		t.Fatalf("store fixer session: %v", err)
 	}
 	sctx.Sessions = pipeline.NewRunSessions(sctx.DB, sctx.Run.ID, ag, true)

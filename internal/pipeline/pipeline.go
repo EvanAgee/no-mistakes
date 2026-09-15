@@ -77,6 +77,11 @@ type StepContext struct {
 	// machinery remains role-generic for legacy recovery; nil runs every
 	// invocation cold.
 	Sessions *RunSessions
+	// Routing selects which approved native execution profile serves each
+	// agent invocation of this run. Nil means routing is unconfigured, which
+	// is the default and leaves every invocation exactly as it was before
+	// routing existed.
+	Routing *RunRouting
 	// Shared carries in-memory run-scoped results one step hands to a later
 	// step in the same run (e.g. the combined document+lint pass).
 	Shared             *RunShared

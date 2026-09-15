@@ -22,6 +22,7 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/git"
 	"github.com/kunchenguid/no-mistakes/internal/ipc"
 	"github.com/kunchenguid/no-mistakes/internal/paths"
+	"github.com/kunchenguid/no-mistakes/internal/routing"
 	"github.com/kunchenguid/no-mistakes/internal/safeurl"
 	"github.com/kunchenguid/no-mistakes/internal/telemetry"
 	"github.com/kunchenguid/no-mistakes/internal/types"
@@ -58,7 +59,19 @@ type Executor struct {
 	// carries run-scoped step-to-step results. Both are created per Execute.
 	sessions *RunSessions
 	shared   *RunShared
-	workDir  string
+	// routing selects which approved native profile serves each invocation of
+	// this run. Created per Execute, and nil whenever routing is unconfigured.
+	routing *RunRouting
+	// newRoutedAgent builds the adapter for one approved profile. The daemon
+	// supplies it, because adapter construction needs the evidence root, path
+	// lookup and environment overlay the daemon owns. Nil disables routing.
+	newRoutedAgent func(routing.Profile) (agent.Agent, error)
+	// routingOwner and routingGeneration identify this daemon incarnation to
+	// the assignment hook, so a recovered run reclaiming its own assignments
+	// is distinguishable from an unrelated process reusing an id.
+	routingOwner      string
+	routingGeneration string
+	workDir           string
 
 	mu                   sync.Mutex
 	approvalCh           chan approvalResponse // buffered channel for approval responses
@@ -209,7 +222,9 @@ func (e *Executor) Execute(ctx context.Context, run *db.Run, repo *db.Repo, work
 		return e.failRun(run, repo, fmt.Errorf("create log dir: %w", err))
 	}
 
-	e.initializeRunScopes(run.ID)
+	if err := e.initializeRunScopes(run.ID); err != nil {
+		return e.failRun(run, repo, err)
+	}
 
 	// Create step result records in DB
 	stepRecords := make(map[types.StepName]*db.StepResult)
@@ -293,10 +308,40 @@ func (e *Executor) prepareRestart(runID string, name types.StepName, currentInde
 	return index, nil
 }
 
-func (e *Executor) initializeRunScopes(runID string) {
+func (e *Executor) initializeRunScopes(runID string) error {
 	sessionsEnabled := e.config != nil && e.config.SessionReuse && e.agent != nil
 	e.sessions = NewRunSessions(e.db, runID, e.agent, sessionsEnabled)
 	e.shared = &RunShared{}
+	router, err := e.buildRouter()
+	if err != nil {
+		// Misconfigured routing fails the run rather than silently launching
+		// the default agent: routing exists to keep work off excluded routes,
+		// and quietly ignoring it would defeat that on every invocation.
+		return err
+	}
+	e.routing = NewRunRouting(router, runID, e.newRoutedAgent)
+	return nil
+}
+
+// buildRouter creates the run's assignment router from global configuration.
+// It returns nil, nil when routing is unconfigured, which is the default.
+func (e *Executor) buildRouter() (*routing.Router, error) {
+	if e.config == nil || !e.config.Assignment.Enabled() || e.newRoutedAgent == nil {
+		return nil, nil
+	}
+	return routing.NewRouter(e.config.Assignment.Hook(), e.config.Assignment.Profiles, e.routingOwner, e.routingGeneration)
+}
+
+// SetRouting supplies the adapter factory and this daemon incarnation's
+// identity for continuous assignment routing. Routing stays off until both a
+// factory and an enabled assignment configuration are present.
+func (e *Executor) SetRouting(newAgent func(routing.Profile) (agent.Agent, error), owner, generation string) {
+	if e == nil {
+		return
+	}
+	e.newRoutedAgent = newAgent
+	e.routingOwner = owner
+	e.routingGeneration = generation
 }
 
 type stepExecutionState struct {
@@ -363,7 +408,9 @@ func (e *Executor) Resume(ctx context.Context, run *db.Run, repo *db.Repo, workD
 	if err := os.MkdirAll(logDir, 0o755); err != nil {
 		return e.failRun(run, repo, fmt.Errorf("create log dir: %w", err))
 	}
-	e.initializeRunScopes(run.ID)
+	if err := e.initializeRunScopes(run.ID); err != nil {
+		return e.failRun(run, repo, err)
+	}
 
 	parkStart := time.Unix(*run.AwaitingAgentSince, 0)
 	duration := recoveredStepDuration(gate.stepResult)
@@ -401,6 +448,7 @@ func (e *Executor) Resume(ctx context.Context, run *db.Run, repo *db.Repo, workD
 		StepResultID: gate.stepResult.ID,
 		Agent:        e.agent,
 		Sessions:     e.sessions,
+		Routing:      e.routing,
 		Shared:       e.shared,
 		Log: func(message string) {
 			slog.Info("recovered approval gate reconciliation", "run_id", run.ID, "step", gate.step.Name(), "message", message)
@@ -870,6 +918,7 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 		UserIntent:       userIntent,
 		IntentSource:     userIntentSource,
 		Sessions:         e.sessions,
+		Routing:          e.routing,
 		Shared:           e.shared,
 		EvidenceDir:      e.runEvidenceDir(run.ID),
 		Fixing:           state.fixing,

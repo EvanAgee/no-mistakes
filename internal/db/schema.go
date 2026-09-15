@@ -158,6 +158,9 @@ CREATE TABLE IF NOT EXISTS run_agent_sessions (
     role       TEXT NOT NULL,
     agent      TEXT NOT NULL,
     session_id TEXT NOT NULL,
+    -- Nullable: legacy rows and rows whose execution profile could not be
+    -- established carry no key and are never resumed.
+    profile_key TEXT,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
     PRIMARY KEY (run_id, role)
@@ -323,4 +326,12 @@ var migrationStatements = []string{
 	`ALTER TABLE agent_invocations ADD COLUMN workload_files INTEGER`,
 	`ALTER TABLE agent_invocations ADD COLUMN workload_lines INTEGER`,
 	`ALTER TABLE agent_invocations ADD COLUMN finding_count INTEGER`,
+	// The execution profile a run+role's persisted native session was minted
+	// under. Nullable: a row written before routing existed, or one whose
+	// effective identity could not be established, carries no key and is
+	// therefore never resumed - a session id is only reusable by the exact
+	// adapter/provider/model/billing route that minted it, and two aliases of
+	// the same adapter name prove nothing about that. See
+	// internal/pipeline/profilekey.go for what the key encodes.
+	`ALTER TABLE run_agent_sessions ADD COLUMN profile_key TEXT`,
 }

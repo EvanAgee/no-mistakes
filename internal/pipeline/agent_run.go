@@ -62,16 +62,35 @@ func (sctx *StepContext) runAgent(parent context.Context, opts agent.RunOpts, se
 		ag = sctx.Agent
 		timeout = AgentTimeout(sctx.Config)
 	}
+
+	// Routing wraps the invocation, not the deadline: a route is acquired
+	// before the process starts and released after it ends, whatever ends it.
+	// This is the single seam every step's agent invocation passes through -
+	// review, fix, test, document, lint, intent - so placing acquire/finish
+	// here is what makes "every native invocation is routed" true by
+	// construction rather than by each step remembering to ask.
+	assignment, routed, release, err := sctx.acquireRoute(parent, &opts, &ag)
+	if err != nil {
+		return nil, err
+	}
+	if routed {
+		defer release()
+	}
+
 	activity := observeAgentActivity(&opts)
-	return invokeAgent(parent, timeout, activity, func(ctx context.Context) (*agent.Result, error) {
+	result, err := invokeAgent(parent, timeout, activity, func(ctx context.Context) (*agent.Result, error) {
 		if sessionRole != "" && sctx != nil && sctx.Sessions != nil {
-			return sctx.Sessions.Run(ctx, ag, sessionRole, opts, sctx.Log)
+			return sctx.Sessions.Run(ctx, ag, sessionRole, assignment.ProfileKey(), opts, sctx.Log)
 		}
 		if ag == nil {
 			return nil, errors.New("nil agent")
 		}
 		return ag.Run(ctx, opts)
 	})
+	if routed {
+		sctx.recordRouteOutcome(assignment, err)
+	}
+	return result, err
 }
 
 func invokeAgent(parent context.Context, timeout time.Duration, activity *agentActivity, run func(context.Context) (*agent.Result, error)) (*agent.Result, error) {

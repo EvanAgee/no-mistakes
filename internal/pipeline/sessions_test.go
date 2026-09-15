@@ -10,6 +10,7 @@ import (
 
 	"github.com/kunchenguid/no-mistakes/internal/agent"
 	"github.com/kunchenguid/no-mistakes/internal/db"
+	"github.com/kunchenguid/no-mistakes/internal/routing"
 )
 
 // sessionCall records one invocation the fake adapter received.
@@ -99,7 +100,7 @@ func TestRunSessions_RoleReusesOneSession(t *testing.T) {
 	rs := NewRunSessions(d, run.ID, fake, true)
 
 	for i := 0; i < 4; i++ {
-		if _, err := rs.Run(context.Background(), fake, SessionRoleReviewer, agent.RunOpts{Prompt: fmt.Sprintf("review round %d", i+1)}, nil); err != nil {
+		if _, err := rs.Run(context.Background(), fake, SessionRoleReviewer, routing.UnroutedProfileKey, agent.RunOpts{Prompt: fmt.Sprintf("review round %d", i+1)}, nil); err != nil {
 			t.Fatalf("round %d: %v", i+1, err)
 		}
 	}
@@ -131,7 +132,7 @@ func TestRunSessions_RolesKeepDistinctSessions(t *testing.T) {
 	// review -> fix -> rereview -> fix -> rereview
 	turns := []SessionRole{SessionRoleReviewer, SessionRoleFixer, SessionRoleReviewer, SessionRoleFixer, SessionRoleReviewer}
 	for i, role := range turns {
-		if _, err := rs.Run(context.Background(), fake, role, agent.RunOpts{Prompt: fmt.Sprintf("turn %d", i)}, nil); err != nil {
+		if _, err := rs.Run(context.Background(), fake, role, routing.UnroutedProfileKey, agent.RunOpts{Prompt: fmt.Sprintf("turn %d", i)}, nil); err != nil {
 			t.Fatalf("turn %d: %v", i, err)
 		}
 	}
@@ -175,12 +176,12 @@ func TestRunSessions_ResumeFailureFallsBackToFreshSameRoleSession(t *testing.T) 
 	fake := newFakeSessionAgent()
 	rs := NewRunSessions(d, run.ID, fake, true)
 
-	if _, err := rs.Run(context.Background(), fake, SessionRoleReviewer, agent.RunOpts{Prompt: "initial review"}, nil); err != nil {
+	if _, err := rs.Run(context.Background(), fake, SessionRoleReviewer, routing.UnroutedProfileKey, agent.RunOpts{Prompt: "initial review"}, nil); err != nil {
 		t.Fatalf("initial: %v", err)
 	}
 	fake.failResumes["sess-1"] = errors.New("session not found")
 
-	result, err := rs.Run(context.Background(), fake, SessionRoleReviewer, agent.RunOpts{Prompt: "rereview"}, nil)
+	result, err := rs.Run(context.Background(), fake, SessionRoleReviewer, routing.UnroutedProfileKey, agent.RunOpts{Prompt: "rereview"}, nil)
 	if err != nil {
 		t.Fatalf("rereview must fall back, got error: %v", err)
 	}
@@ -197,7 +198,7 @@ func TestRunSessions_ResumeFailureFallsBackToFreshSameRoleSession(t *testing.T) 
 	}
 
 	// The next turn resumes the replacement session, not the dead one.
-	if _, err := rs.Run(context.Background(), fake, SessionRoleReviewer, agent.RunOpts{Prompt: "third"}, nil); err != nil {
+	if _, err := rs.Run(context.Background(), fake, SessionRoleReviewer, routing.UnroutedProfileKey, agent.RunOpts{Prompt: "third"}, nil); err != nil {
 		t.Fatalf("third: %v", err)
 	}
 	third := fake.calls[len(fake.calls)-1]
@@ -214,7 +215,7 @@ func TestRunSessions_FreshSessionFailurePropagates(t *testing.T) {
 	fake.failNext = errors.New("provider down")
 	rs := NewRunSessions(d, run.ID, fake, true)
 
-	_, err := rs.Run(context.Background(), fake, SessionRoleReviewer, agent.RunOpts{Prompt: "review"}, nil)
+	_, err := rs.Run(context.Background(), fake, SessionRoleReviewer, routing.UnroutedProfileKey, agent.RunOpts{Prompt: "review"}, nil)
 	if err == nil || err.Error() != "provider down" {
 		t.Fatalf("fresh-session failure must propagate, got %v", err)
 	}
@@ -230,7 +231,7 @@ func TestRunSessions_CancelledContextDoesNotRetry(t *testing.T) {
 	fake := newFakeSessionAgent()
 	rs := NewRunSessions(d, run.ID, fake, true)
 
-	if _, err := rs.Run(context.Background(), fake, SessionRoleReviewer, agent.RunOpts{Prompt: "initial"}, nil); err != nil {
+	if _, err := rs.Run(context.Background(), fake, SessionRoleReviewer, routing.UnroutedProfileKey, agent.RunOpts{Prompt: "initial"}, nil); err != nil {
 		t.Fatalf("initial: %v", err)
 	}
 
@@ -238,7 +239,7 @@ func TestRunSessions_CancelledContextDoesNotRetry(t *testing.T) {
 	cancel()
 	fake.failResumes["sess-1"] = context.Canceled
 
-	_, err := rs.Run(ctx, fake, SessionRoleReviewer, agent.RunOpts{Prompt: "rereview"}, nil)
+	_, err := rs.Run(ctx, fake, SessionRoleReviewer, routing.UnroutedProfileKey, agent.RunOpts{Prompt: "rereview"}, nil)
 	if err == nil {
 		t.Fatal("cancelled run must fail")
 	}
@@ -255,7 +256,7 @@ func TestRunSessions_ColdWhenAgentLacksSessions(t *testing.T) {
 	fake.supportsFlag = false
 	rs := NewRunSessions(d, run.ID, fake, true)
 
-	result, err := rs.Run(context.Background(), fake, SessionRoleReviewer, agent.RunOpts{Prompt: "review"}, nil)
+	result, err := rs.Run(context.Background(), fake, SessionRoleReviewer, routing.UnroutedProfileKey, agent.RunOpts{Prompt: "review"}, nil)
 	if err != nil {
 		t.Fatalf("cold run: %v", err)
 	}
@@ -274,7 +275,7 @@ func TestRunSessions_DisabledRunsCold(t *testing.T) {
 	fake := newFakeSessionAgent()
 	rs := NewRunSessions(d, run.ID, fake, false)
 
-	if _, err := rs.Run(context.Background(), fake, SessionRoleReviewer, agent.RunOpts{Prompt: "review"}, nil); err != nil {
+	if _, err := rs.Run(context.Background(), fake, SessionRoleReviewer, routing.UnroutedProfileKey, agent.RunOpts{Prompt: "review"}, nil); err != nil {
 		t.Fatalf("run: %v", err)
 	}
 	if fake.calls[0].session != nil {
@@ -288,7 +289,7 @@ func TestRunSessions_NilManagerRunsCold(t *testing.T) {
 	fake := newFakeSessionAgent()
 	var rs *RunSessions
 
-	if _, err := rs.Run(context.Background(), fake, SessionRoleReviewer, agent.RunOpts{Prompt: "review"}, nil); err != nil {
+	if _, err := rs.Run(context.Background(), fake, SessionRoleReviewer, routing.UnroutedProfileKey, agent.RunOpts{Prompt: "review"}, nil); err != nil {
 		t.Fatalf("run: %v", err)
 	}
 	if fake.calls[0].session != nil {
@@ -303,13 +304,13 @@ func TestRunSessions_PersistsAcrossManagers(t *testing.T) {
 	d, run := sessionTestDB(t)
 	fake := newFakeSessionAgent()
 	rs := NewRunSessions(d, run.ID, fake, true)
-	if _, err := rs.Run(context.Background(), fake, SessionRoleReviewer, agent.RunOpts{Prompt: "review"}, nil); err != nil {
+	if _, err := rs.Run(context.Background(), fake, SessionRoleReviewer, routing.UnroutedProfileKey, agent.RunOpts{Prompt: "review"}, nil); err != nil {
 		t.Fatalf("initial: %v", err)
 	}
 
 	// Same run, fresh manager (e.g. daemon restart): resumes the identity.
 	rs2 := NewRunSessions(d, run.ID, fake, true)
-	if _, err := rs2.Run(context.Background(), fake, SessionRoleReviewer, agent.RunOpts{Prompt: "rereview"}, nil); err != nil {
+	if _, err := rs2.Run(context.Background(), fake, SessionRoleReviewer, routing.UnroutedProfileKey, agent.RunOpts{Prompt: "rereview"}, nil); err != nil {
 		t.Fatalf("rereview: %v", err)
 	}
 	second := fake.calls[len(fake.calls)-1]
@@ -327,7 +328,7 @@ func TestRunSessions_PersistsAcrossManagers(t *testing.T) {
 		t.Fatalf("insert other run: %v", err)
 	}
 	rs3 := NewRunSessions(d, otherRun.ID, fake, true)
-	if _, err := rs3.Run(context.Background(), fake, SessionRoleReviewer, agent.RunOpts{Prompt: "other review"}, nil); err != nil {
+	if _, err := rs3.Run(context.Background(), fake, SessionRoleReviewer, routing.UnroutedProfileKey, agent.RunOpts{Prompt: "other review"}, nil); err != nil {
 		t.Fatalf("other run: %v", err)
 	}
 	third := fake.calls[len(fake.calls)-1]
@@ -346,7 +347,7 @@ func TestRunSessions_FallbackResumesWithItsActualProvider(t *testing.T) {
 	fallback := agent.NewFallback([]agent.Agent{codex, claude})
 
 	rs := NewRunSessions(d, run.ID, fallback, true)
-	if _, err := rs.Run(context.Background(), fallback, SessionRoleReviewer, agent.RunOpts{Prompt: "review"}, nil); err != nil {
+	if _, err := rs.Run(context.Background(), fallback, SessionRoleReviewer, routing.UnroutedProfileKey, agent.RunOpts{Prompt: "review"}, nil); err != nil {
 		t.Fatalf("initial: %v", err)
 	}
 	stored, err := d.GetRunAgentSessions(run.ID)
@@ -358,7 +359,7 @@ func TestRunSessions_FallbackResumesWithItsActualProvider(t *testing.T) {
 	}
 
 	rs = NewRunSessions(d, run.ID, fallback, true)
-	if _, err := rs.Run(context.Background(), fallback, SessionRoleReviewer, agent.RunOpts{Prompt: "rereview"}, nil); err != nil {
+	if _, err := rs.Run(context.Background(), fallback, SessionRoleReviewer, routing.UnroutedProfileKey, agent.RunOpts{Prompt: "rereview"}, nil); err != nil {
 		t.Fatalf("rereview: %v", err)
 	}
 	if len(codex.calls) != 1 {
@@ -374,13 +375,13 @@ func TestRunSessions_FallbackResumesWithItsActualProvider(t *testing.T) {
 // from a different adapter is never fed to the current one.
 func TestRunSessions_AgentChangeDiscardsStoredSession(t *testing.T) {
 	d, run := sessionTestDB(t)
-	if err := d.UpsertRunAgentSession(run.ID, string(SessionRoleReviewer), "codex", "codex-thread"); err != nil {
+	if err := d.UpsertRunAgentSession(run.ID, string(SessionRoleReviewer), "codex", "codex-thread", ""); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 
 	fake := newFakeSessionAgent() // Name() == "fake", not "codex"
 	rs := NewRunSessions(d, run.ID, fake, true)
-	if _, err := rs.Run(context.Background(), fake, SessionRoleReviewer, agent.RunOpts{Prompt: "review"}, nil); err != nil {
+	if _, err := rs.Run(context.Background(), fake, SessionRoleReviewer, routing.UnroutedProfileKey, agent.RunOpts{Prompt: "review"}, nil); err != nil {
 		t.Fatalf("run: %v", err)
 	}
 	if call := fake.calls[0]; call.session == nil || call.session.ID != "" {

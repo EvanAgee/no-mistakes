@@ -38,7 +38,7 @@ func TestValidateRecoveredSessionProviders_RejectsUnavailableFixerProvider(t *te
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := database.UpsertRunAgentSession(run.ID, string(pipeline.SessionRoleFixer), "codex", "fixer-session"); err != nil {
+	if err := database.UpsertRunAgentSession(run.ID, string(pipeline.SessionRoleFixer), "codex", "fixer-session", ""); err != nil {
 		t.Fatal(err)
 	}
 	claude, err := agent.New(types.AgentClaude, "claude", nil)

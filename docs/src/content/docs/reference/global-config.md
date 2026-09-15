@@ -578,6 +578,81 @@ Session identities are persisted only as minimum local resume metadata, never as
 The [daemon crash-recovery reference](/no-mistakes/concepts/daemon/#crash-recovery) owns which parked gates can resume or reconcile after a restart.
 Set `false` to force every agent invocation cold.
 
+### assignment
+
+Continuous routing: which approved native execution profile serves each agent invocation.
+
+|         |          |
+| ------- | -------- |
+| Type    | `object` |
+| Default | unset    |
+
+Unset means routing is off, and every invocation launches the configured agent exactly as it did before this setting existed.
+
+Routing exists for one job: spreading a run's work across several subscriptions you already pay for, without asking anything each time.
+Instead of one agent serving every turn, each invocation asks an external hook which approved service should serve it next.
+A process already running is never touched; the choice applies to the next invocation.
+
+Global-only, like `agent_config`: it decides which process runs with this machine's credentials against which subscription, so a pushed branch must never influence it.
+
+```yaml
+assignment:
+  hook_path: /opt/firstmate/bin/fm-route
+  hook_args: ["--json"]
+  hook_timeout: 30s
+  max_evidence_age: 10m
+  profiles:
+    - id: claude-opus
+      agent: claude
+      provider: anthropic-subscription
+      model: opus
+      effort: xhigh
+    - id: codex-sol
+      agent: codex
+      provider: openai-subscription
+      model: gpt-5.6-sol
+      effort: high
+    - id: pi-grok
+      agent: pi
+      provider: xai-subscription
+      model: xai/grok-4.6
+      effort: xhigh
+    - id: pi-deepseek
+      agent: pi
+      provider: vercel-ai-gateway
+      model: vercel-ai-gateway/deepseek/deepseek-v4.1-flash
+      effort: xhigh
+      roles: ["review-fix"]
+```
+
+`hook_path` and `hook_args` name the executable and its fixed leading arguments.
+It is run directly, never through a shell, and receives one JSON request on standard input: the assignment identity, this daemon's owner and generation, the role, and the profile ids it may choose among.
+It answers with one JSON object naming a selected id, or reporting that it deferred.
+
+A hook can only pick from the ids you listed here.
+It cannot name a command, a path, a model, or a route you did not approve.
+Anything else - an unknown id, unreadable or oversized output, a nonzero exit, a timeout - stops that invocation with an error and launches nothing.
+It never quietly falls back to your default agent, because that is exactly how an excluded service would end up running anyway.
+
+A deferral is not a failure and is not remembered.
+It means no approved service is admissible right now, and the same work can be retried once the hook's evidence refreshes.
+
+`hook_timeout` bounds one hook call (default 30s).
+`max_evidence_age` bounds how old the hook's own observation may be before a selection is logged as made from evidence it could not date as current; it is recorded, not enforced, because the hook owns eligibility.
+
+Each profile needs an `id` unique to this file, an `agent`, and a `provider`.
+`agent` must be `claude`, `codex`, or `pi`; those are the adapters whose session, structured-output, and project-instruction behavior no-mistakes verifies natively.
+`pi` covers both Grok and Gateway-served models, which is why those are two profiles rather than two adapters.
+`provider` is your own stable label for the billing route, such as `anthropic-subscription` or `vercel-ai-gateway`.
+It is never a credential and never the account a proxy currently has selected: keep it unchanged across token and account rotation, or every rotation throws away a reusable session.
+`model` and `effort` are the same harness-neutral knobs as [`agent_config`](#agent_config), validated against what that harness can express.
+`roles`, when set, restricts the profile to those pipeline duties; omit it to allow every role.
+
+Session reuse follows the profile, not the adapter name.
+Consecutive turns on the same profile resume the same native session; a turn on a different profile always starts a fresh one, because a session id belongs to the exact service that minted it.
+Two `pi` profiles are a different service in this sense even though they share a binary.
+Runs parked by an earlier version keep working: their sessions have no recorded profile, so they resume normally while routing is off and start fresh once routing is on.
+
 ### worktree_roots
 
 Where a repository's pipeline run worktrees are created.

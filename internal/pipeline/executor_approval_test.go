@@ -153,10 +153,10 @@ func TestExecutor_ResumeRestoresParkedGateAndReviewSessions(t *testing.T) {
 	if err := database.SetRunAwaitingAgent(run.ID); err != nil {
 		t.Fatal(err)
 	}
-	if err := database.UpsertRunAgentSession(run.ID, string(SessionRoleReviewer), "fake", "reviewer-session"); err != nil {
+	if err := database.UpsertRunAgentSession(run.ID, string(SessionRoleReviewer), "fake", "reviewer-session", ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := database.UpsertRunAgentSession(run.ID, string(SessionRoleFixer), "fake", "fixer-session"); err != nil {
+	if err := database.UpsertRunAgentSession(run.ID, string(SessionRoleFixer), "fake", "fixer-session", ""); err != nil {
 		t.Fatal(err)
 	}
 	run, err = database.GetRun(run.ID)

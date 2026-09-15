@@ -51,6 +51,10 @@ type RunManager struct {
 	db           *db.DB
 	paths        *paths.Paths
 	steps        StepFactory
+	// routingGeneration names this daemon incarnation to the assignment hook.
+	// It is fixed at construction so every run of this process, including a
+	// run resumed after crash recovery, reports the same generation.
+	routingGeneration string
 
 	branchLocks sync.Map // repoID+"/"+branch → *sync.Mutex
 
@@ -93,6 +97,8 @@ func NewRunManager(database *db.DB, p *paths.Paths, stepFactory StepFactory) *Ru
 		subscribers:   make(map[string][]*eventMailbox),
 		stateRevs:     make(map[string]int64),
 		completedRuns: make(map[string]bool),
+
+		routingGeneration: routingGeneration(os.Getpid(), time.Now()),
 	}
 }
 
@@ -388,6 +394,9 @@ func (m *RunManager) resumeRecoveredRun(plan recoveredRunPlan) {
 	}
 	runCtx, cancel := context.WithCancelCause(context.Background())
 	executor := pipeline.NewExecutor(m.db, m.paths, plan.cfg, plan.agent, plan.steps, m.broadcast)
+	executor.SetRouting(
+		m.newRoutedAgentFactory(plan.cfg, m.paths.EvidenceRoot(plan.cfg.Test.Evidence.LocalRoot), forgeEnvironment(plan.forge)),
+		routingOwner(), m.routingGeneration)
 	executor.SetOnPRMerged(func(_ context.Context, runID string) {
 		m.wg.Add(1)
 		go func() {
@@ -1428,6 +1437,9 @@ func (m *RunManager) startRunWithIntentSourceLocked(ctx context.Context, repo *d
 	// Create executor with event broadcast.
 	runCtx, cancel := context.WithCancelCause(context.Background())
 	executor := pipeline.NewExecutor(m.db, m.paths, cfg, ag, execSteps, m.broadcast)
+	executor.SetRouting(
+		m.newRoutedAgentFactory(cfg, m.paths.EvidenceRoot(cfg.Test.Evidence.LocalRoot), forgeEnvironment(forgeCtx)),
+		routingOwner(), m.routingGeneration)
 	executor.SetForgeContext(forgeCtx)
 	executor.SetSkippedSteps(skipSteps)
 	executor.SetOnPRMerged(func(_ context.Context, runID string) {
