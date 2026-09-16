@@ -576,6 +576,7 @@ The fixer session is never lent to review turns, other pipeline steps stay sessi
 When resume is unavailable or fails, the fix turn falls back to a cold run or a fresh fixer session and the fallback is recorded in the local `agent_invocations` performance record. Pi emits per-invocation usage after a resume, unlike Codex's cumulative session counters.
 Session identities are persisted only as minimum local resume metadata, never as prompts or transcripts; Pi's own session directory retains its native transcript. Keep Pi's session directory private, and keep any `--session-dir` or `PI_CODING_AGENT_SESSION_DIR` setting stable while a run is active so a daemon restart can find the fixer session.
 The [daemon crash-recovery reference](/no-mistakes/concepts/daemon/#crash-recovery) owns which parked gates can resume or reconcile after a restart.
+Under [`assignment`](#assignment) the adapter that resumes is the one the hook selected for that turn, not the agent you configured, so a run configured with a non-resuming agent still reuses sessions on turns routed to a resuming one; that section owns how a profile's identity qualifies reuse.
 Set `false` to force every agent invocation cold.
 
 ### assignment
@@ -657,10 +658,11 @@ It means no approved service is admissible right now, and the same work can be r
 `already-closed` means that exact launch already ran.
 It carries no route on purpose, so it can never authorize a second run of work the hook has already counted.
 Every launch gets its own assignment id, so a retry or a recovered turn is a new launch rather than a replay of a spent one.
+The unit is a launch, not a pipeline turn: one turn can be two launches when a stored session fails to resume and the same prompt is re-run in a fresh session, and each of those processes acquires and reports separately.
 The id carries the daemon incarnation as well as the run, because the hook recognises a repeat id by (id, owner identity) and ignores the generation there: without it, a run resumed after a daemon restart would re-acquire the ids the previous incarnation already closed.
 
-When a turn ends, no-mistakes calls `finish` with the assignment id, the outcome, and the profile that actually ran.
-A completed turn reports `success`; anything else reports `launch-failed`, which releases the assignment without claiming the service is broken.
+When a launch ends, no-mistakes calls `finish` with its assignment id, the outcome, and the profile that actually ran.
+A completed launch reports `success`; anything else reports `launch-failed`, which releases the assignment without claiming the service is broken.
 The hook's other outcomes (`auth-failed`, `exhausted`, `outage`) take a route out of the pool for every caller on the machine, so no-mistakes never reports one on a guess about why a turn failed.
 
 `hook_timeout` bounds one hook call (default 30s).
