@@ -218,8 +218,19 @@ func (rs *RunSessions) resumable(role SessionRole, profileKey string, logf func(
 // service's provider would reject every routed session and leave the whole run
 // permanently cold.
 //
+// An empty profileKey means the turn's execution identity was never
+// established, so there is nothing a later turn could match it against.
+// Storing it anyway would write a key-less row byte-identical to the
+// pre-routing shape, and the legacy upgrade path would then hand that id to an
+// unrouted turn on a whatever provider the run's default agent names. The role
+// is forgotten instead, so an unknown identity leaves no resumable trace.
+//
 // Persistence failures are ignored: reuse degrades, correctness does not.
 func (rs *RunSessions) remember(role SessionRole, invoked agent.Agent, sessionID, provider, profileKey string) {
+	if profileKey == "" {
+		rs.forget(role)
+		return
+	}
 	if sessionID == "" {
 		return
 	}

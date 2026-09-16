@@ -846,3 +846,92 @@ func TestRoutedSessions_RoutedTurnNeverResumesALegacyRow(t *testing.T) {
 		t.Fatal("the pre-upgrade id must never reach a routed invocation")
 	}
 }
+
+// TestRoutedSessions_UnknownKeyTurnLeavesNoLegacyLookingRow proves an
+// unestablished identity persists nothing a later turn can resume. A routed
+// turn whose profile key is empty used to write a key-less row, which is
+// byte-identical to the pre-routing shape, so the legacy upgrade path then
+// handed that id to an unrouted turn running a DIFFERENT provider.
+func TestRoutedSessions_UnknownKeyTurnLeavesNoLegacyLookingRow(t *testing.T) {
+	d, run := sessionTestDB(t)
+	counter := newMintCounter()
+
+	unknown := routing.Profile{ID: "pi-default", Agent: types.AgentPi, Provider: "vercel-ai-gateway"}
+	if routing.ProfileKey(unknown) != "" {
+		t.Fatal("this test requires a profile whose identity cannot be established")
+	}
+
+	routed := NewRunSessions(d, run.ID, newFakeSessionAgent(), true)
+	deepseek := newProfileAgent(unknown, counter)
+	minted, err := routed.Run(context.Background(), deepseek, SessionRoleFixer,
+		routing.ProfileKey(unknown), agent.RunOpts{Prompt: "fix on an unestablished identity"}, nil)
+	if err != nil {
+		t.Fatalf("routed turn: %v", err)
+	}
+	if minted.SessionID == "" {
+		t.Fatal("the adapter must have minted an id for this test to mean anything")
+	}
+
+	rows, err := d.GetRunAgentSessions(run.ID)
+	if err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	for _, row := range rows {
+		if row.Role == string(SessionRoleFixer) {
+			t.Fatalf("an unknown identity must persist no resumable row, got %+v", row)
+		}
+	}
+
+	// Routing is then switched off and the daemon restarts, so every turn
+	// carries the unrouted key and the run's own default adapter launches.
+	fake := newFakeSessionAgent()
+	unrouted := NewRunSessions(d, run.ID, fake, true)
+	if _, err := unrouted.Run(context.Background(), fake, SessionRoleFixer,
+		routing.UnroutedProfileKey, agent.RunOpts{Prompt: "fix with routing off"}, nil); err != nil {
+		t.Fatalf("unrouted turn: %v", err)
+	}
+	if got := fake.calls[0].session; got == nil || got.ID != "" {
+		t.Fatalf("an unrouted turn must start fresh, got %+v", got)
+	}
+	if got := fake.calls[0].session; got != nil && got.ID == minted.SessionID {
+		t.Fatal("an id minted under an unestablished identity must never reach another provider")
+	}
+}
+
+// TestRoutedSessions_UnknownKeyTurnDropsAnEarlierResumableRow proves the same
+// rule applies to a row that already existed. A matching turn establishes a
+// resumable session, then an unknown-identity turn on the same role runs; the
+// earlier row must not survive as a key-less record a later unrouted turn
+// would treat as its own legacy state.
+func TestRoutedSessions_UnknownKeyTurnDropsAnEarlierResumableRow(t *testing.T) {
+	d, run := sessionTestDB(t)
+	counter := newMintCounter()
+	manager := NewRunSessions(d, run.ID, newFakeSessionAgent(), true)
+
+	known := routingPiDeepSeekProfile()
+	established := newProfileAgent(known, counter)
+	if _, err := manager.Run(context.Background(), established, SessionRoleFixer,
+		routing.ProfileKey(known), agent.RunOpts{Prompt: "establish a session"}, nil); err != nil {
+		t.Fatalf("established turn: %v", err)
+	}
+
+	unknown := routing.Profile{ID: "pi-default", Agent: types.AgentPi, Provider: "vercel-ai-gateway"}
+	if routing.ProfileKey(unknown) != "" {
+		t.Fatal("this test requires a profile whose identity cannot be established")
+	}
+	stranger := newProfileAgent(unknown, counter)
+	if _, err := manager.Run(context.Background(), stranger, SessionRoleFixer,
+		routing.ProfileKey(unknown), agent.RunOpts{Prompt: "fix on an unestablished identity"}, nil); err != nil {
+		t.Fatalf("unknown-identity turn: %v", err)
+	}
+
+	rows, err := d.GetRunAgentSessions(run.ID)
+	if err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	for _, row := range rows {
+		if row.Role == string(SessionRoleFixer) {
+			t.Fatalf("the earlier row must not survive an unknown-identity turn, got %+v", row)
+		}
+	}
+}

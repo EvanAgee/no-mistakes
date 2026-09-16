@@ -189,7 +189,10 @@ func ProfileKey(p Profile) string {
 	return profileKeyVersion + ":" + hex.EncodeToString(sum[:])
 }
 
-// escapeKeyValue makes every value unambiguous inside the canonical encoding.
+// escapeKeyValue makes every value unambiguous inside the canonical encoding:
+// a backslash doubles, an equals sign and a field separator each become a
+// distinct backslash escape, so no value can reproduce a raw separator byte
+// and forge a field boundary.
 func escapeKeyValue(value string) string {
 	var b strings.Builder
 	for _, r := range value {
@@ -197,7 +200,7 @@ func escapeKeyValue(value string) string {
 		case '\\':
 			b.WriteString(`\\`)
 		case '':
-			b.WriteString(``)
+			b.WriteString(`\u`)
 		case '=':
 			b.WriteString(`\=`)
 		default:

@@ -187,6 +187,66 @@ func TestProfileKey_EscapingPreventsFieldForgery(t *testing.T) {
 	}
 }
 
+// TestProfileKey_FieldSeparatorInAValueCannotShiftAFieldBoundary proves the
+// separator is escaped in its own right, not only blocked by the equals-sign
+// escape. Two profiles differing ONLY by where a legitimate separator byte
+// falls inside their values must produce different keys; without a real
+// separator escape both canonicalize to the same byte sequence.
+func TestProfileKey_FieldSeparatorInAValueCannotShiftAFieldBoundary(t *testing.T) {
+	left := claudeProfile()
+	left.Provider = "route" + fieldSep
+	left.Tuning.Model = "opus"
+
+	right := claudeProfile()
+	right.Provider = "route"
+	right.Tuning.Model = fieldSep + "opus"
+
+	if ProfileKey(left) == ProfileKey(right) {
+		t.Fatal("profiles differing only by where the separator byte falls must not share a key")
+	}
+}
+
+// TestEscapeKeyValue_EmitsNoRawSeparator proves the encoding is injective into
+// field boundaries: no escaped value can reproduce the raw separator byte, so
+// the canonical string has exactly as many separators as it has real fields.
+func TestEscapeKeyValue_EmitsNoRawSeparator(t *testing.T) {
+	for _, value := range []string{
+		fieldSep,
+		"a" + fieldSep + "b",
+		`\` + fieldSep,
+		"model=x" + fieldSep + "model=y",
+	} {
+		if strings.Contains(escapeKeyValue(value), fieldSep) {
+			t.Fatalf("escaped %q still contains a raw field separator", value)
+		}
+	}
+}
+
+// TestEscapeKeyValue_IsInjective proves the three escapes do not collide with
+// one another: distinct values must escape to distinct strings, or two
+// profiles could still canonicalize identically.
+func TestEscapeKeyValue_IsInjective(t *testing.T) {
+	values := []string{
+		"",
+		fieldSep,
+		"=",
+		`\`,
+		`\u`,
+		`\` + fieldSep,
+		`\=`,
+		"u" + fieldSep,
+		fieldSep + "u",
+	}
+	seen := map[string]string{}
+	for _, value := range values {
+		escaped := escapeKeyValue(value)
+		if prior, ok := seen[escaped]; ok {
+			t.Fatalf("%q and %q both escape to %q", prior, value, escaped)
+		}
+		seen[escaped] = value
+	}
+}
+
 // TestProfileKey_IsVersioned proves every key carries its encoding version, so
 // a future change to what the key means invalidates old keys instead of
 // silently reinterpreting them.
