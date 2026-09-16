@@ -216,8 +216,8 @@ func defaultRunIntent(ctx context.Context, sctx *pipeline.StepContext) (*intent.
 		Threshold:     cfg.Intent.Threshold,
 		Readers:       intent.AllReaders(cfg.Intent.DisabledReaders),
 		Cache:         intent.NewDBCache(sctx.DB),
-		Summarizer:    intent.NewAgentSummarizer(sctx.Agent, gitWorkDir),
-		Disambiguator: intent.NewAgentDisambiguator(sctx.Agent, gitWorkDir),
+		Summarizer:    intent.NewAgentSummarizer(sctx.SeamAgent("intent-summarize"), gitWorkDir),
+		Disambiguator: intent.NewAgentDisambiguator(sctx.SeamAgent("intent-disambiguate"), gitWorkDir),
 		Logf: func(format string, args ...any) {
 			sctx.Log(fmt.Sprintf("intent "+format, args...))
 		},

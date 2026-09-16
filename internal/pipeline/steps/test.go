@@ -290,6 +290,7 @@ func runTestAnalyzer(sctx *pipeline.StepContext, prompt string) (Findings, error
 			CWD:        sctx.WorkDir,
 			JSONSchema: testFindingsSchema,
 			OnChunk:    sctx.LogChunk,
+			Purpose:    "test-evidence",
 		})
 		runErr := testAgentError(evidenceCtx, timeout, "agent run tests", err)
 		if runErr != nil && (context.Cause(evidenceCtx) != nil || !agent.IsStructuredOutputRejected(runErr)) {

@@ -66,9 +66,10 @@ func (sctx *StepContext) runAgent(parent context.Context, opts agent.RunOpts, se
 	// Routing wraps the invocation, not the deadline: a route is acquired
 	// before the process starts and released after it ends, whatever ends it.
 	// This is the single seam every step's agent invocation passes through -
-	// review, fix, test, document, lint, intent - so placing acquire/finish
-	// here is what makes "every native invocation is routed" true by
-	// construction rather than by each step remembering to ask.
+	// review, fix, test, document, lint, rebase, pr, ci, and intent through
+	// SeamAgent - so placing acquire/finish here is what makes "every native
+	// invocation is routed" true by construction rather than by each step
+	// remembering to ask.
 	assignment, routed, release, err := sctx.acquireRoute(parent, &opts, &ag)
 	if err != nil {
 		return nil, err
@@ -389,4 +390,77 @@ func (a *timeoutAgent) ReportsAgentAttempts() bool {
 
 func (a *timeoutAgent) NeutralizesGateInstructions() bool {
 	return agent.NeutralizesGateInstructions(a.inner)
+}
+
+// SeamAgent presents this step context's invocation seam as an agent.Agent.
+//
+// It exists for the two collaborators that take an adapter rather than call
+// the step context directly: the intent summarizer and disambiguator, which
+// internal/intent constructs from an agent.Agent. Handing those the raw
+// sctx.Agent made them the only native invocations in the pipeline that never
+// acquired a route, so they were silently excluded from balancing while the
+// seam's own comment claimed every invocation passed through it.
+//
+// Every call is a full seam invocation: acquire, the invocation deadline,
+// routing's adapter substitution, and finish. Name and the capability
+// predicates answer for the step's configured agent, because that is what runs
+// when routing is off and what a caller inspecting the adapter is asking
+// about; a routed turn substitutes its own adapter inside Run, after the
+// capability question has already been answered for the turn's prompt.
+func (sctx *StepContext) SeamAgent(purpose string) agent.Agent {
+	return &seamAgent{sctx: sctx, purpose: purpose}
+}
+
+type seamAgent struct {
+	sctx    *StepContext
+	purpose string
+}
+
+func (a *seamAgent) Name() string {
+	if a.sctx == nil || a.sctx.Agent == nil {
+		return ""
+	}
+	return a.sctx.Agent.Name()
+}
+
+// Close is a no-op: the step's agent outlives this view of it and is the
+// executor's to close, and a routed adapter is closed by routing's own release.
+func (a *seamAgent) Close() error { return nil }
+
+func (a *seamAgent) Run(ctx context.Context, opts agent.RunOpts) (*agent.Result, error) {
+	if a.sctx == nil {
+		return nil, errors.New("nil step context")
+	}
+	if opts.Purpose == "" {
+		opts.Purpose = a.purpose
+	}
+	return a.sctx.runAgent(ctx, opts, "")
+}
+
+func (a *seamAgent) SupportsSessionResume() bool {
+	if a.sctx == nil {
+		return false
+	}
+	return agent.SupportsSessionResume(a.sctx.Agent)
+}
+
+func (a *seamAgent) SupportsSessionProvider(provider string) bool {
+	if a.sctx == nil {
+		return false
+	}
+	return agent.SupportsSessionProvider(a.sctx.Agent, provider)
+}
+
+func (a *seamAgent) ReportsAgentAttempts() bool {
+	if a.sctx == nil {
+		return false
+	}
+	return agent.ReportsAgentAttempts(a.sctx.Agent)
+}
+
+func (a *seamAgent) NeutralizesGateInstructions() bool {
+	if a.sctx == nil {
+		return false
+	}
+	return agent.NeutralizesGateInstructions(a.sctx.Agent)
 }

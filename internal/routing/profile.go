@@ -49,9 +49,20 @@ type Profile struct {
 }
 
 // AllowedForRole reports whether this profile may serve the named role.
+//
+// An unrestricted profile serves every role, including the empty one. An empty
+// role is deliberately matched by unrestricted profiles ONLY and never by a
+// restricted list, because a role-restricted profile is the operator's
+// statement about one named duty and an unnamed invocation is not that duty.
+// Route reports the no-admissible-profile case as a configuration fault naming
+// the role, so an operator who restricted every profile can see which
+// invocation they left with nothing to run.
 func (p Profile) AllowedForRole(role string) bool {
 	if len(p.Roles) == 0 {
 		return true
+	}
+	if role == "" {
+		return false
 	}
 	for _, allowed := range p.Roles {
 		if allowed == role {

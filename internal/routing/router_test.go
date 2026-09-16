@@ -209,6 +209,63 @@ func TestRouter_RoleWithNothingApprovedIsAConfigurationFault(t *testing.T) {
 	if len(rh.seen()) != 0 {
 		t.Fatal("a role with nothing approved must never reach the hook")
 	}
+	// The message must be actionable on its own: an operator reading a failed
+	// run needs the refused duty and the profiles that exist, or the only
+	// symptom is a hard failure with nothing to change.
+	if !strings.Contains(err.Error(), "test-evidence") {
+		t.Fatalf("error %q must name the refused role", err)
+	}
+	if !strings.Contains(err.Error(), fixerOnly.ID) {
+		t.Fatalf("error %q must list the configured profiles", err)
+	}
+	if !strings.Contains(err.Error(), "roles") {
+		t.Fatalf("error %q must say how to fix the configuration", err)
+	}
+}
+
+// TestRouter_UnnamedInvocationIsServedOnlyByAnUnrestrictedProfile is the case
+// an operator reaches by following the docs and restricting every profile.
+//
+// An invocation that reports no role must not be matched against a restricted
+// list, and when nothing is admissible it must fail with a message that says
+// so in those terms rather than quoting an empty role string the operator
+// would then try to add to a `roles` list.
+func TestRouter_UnnamedInvocationIsServedOnlyByAnUnrestrictedProfile(t *testing.T) {
+	restricted := piGrokProfile()
+	restricted.Roles = []string{"review-fix"}
+
+	rh := &recordingHook{}
+	_, selected, err := testRouter(t, rh, restricted).Route(context.Background(), "run-1-launch-1", "")
+	if !errors.Is(err, ErrNoAllowedProfile) {
+		t.Fatalf("error %v must be ErrNoAllowedProfile", err)
+	}
+	if selected {
+		t.Fatal("an unnamed invocation must not select a role-restricted profile")
+	}
+	if !strings.Contains(err.Error(), "reports no role") {
+		t.Fatalf("error %q must describe the unnamed invocation rather than quote an empty role", err)
+	}
+
+	// The same invocation with one unrestricted profile present is served.
+	rh = &recordingHook{}
+	unrestricted := claudeProfile()
+	assignment, selected, err := testRouter(t, rh, restricted, unrestricted).Route(context.Background(), "run-1-launch-1", "")
+	if err != nil {
+		t.Fatalf("an unrestricted profile must serve an unnamed invocation: %v", err)
+	}
+	if !selected {
+		t.Fatal("want a selection")
+	}
+	if assignment.Profile.ID != unrestricted.ID {
+		t.Fatalf("selected %q, want the unrestricted profile %q", assignment.Profile.ID, unrestricted.ID)
+	}
+	for _, call := range rh.seen() {
+		for _, offered := range call.req.Routes {
+			if offered == restricted.ID {
+				t.Fatal("a role-restricted profile must never be offered for an unnamed invocation")
+			}
+		}
+	}
 }
 
 // TestRouter_FinishReportsTheExactAcquiredIdentity proves the identity sent to

@@ -246,6 +246,7 @@ CI logs:
 		CWD:        sctx.WorkDir,
 		JSONSchema: ciFixConclusionSchema,
 		OnChunk:    sctx.LogChunk,
+		Purpose:    "ci-fix",
 	})
 	if err != nil {
 		return ciRepairResult{}, fmt.Errorf("agent CI fix: %w", err)

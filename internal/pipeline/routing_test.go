@@ -951,3 +951,152 @@ func TestClassifyRouteOutcome_NeverGuessesRouteEvidence(t *testing.T) {
 		}
 	}
 }
+
+// TestSeamAgent_RoutesAnInvocationMadeThroughAnAdapterHandle proves the view
+// that collaborators taking an agent.Agent receive is a full seam invocation.
+//
+// The intent step hands its summarizer and disambiguator an adapter rather than
+// the step context, so before SeamAgent existed those were the only native
+// invocations in the pipeline that acquired no route: they launched the step's
+// default agent whatever the hook would have selected, and were silently absent
+// from balancing.
+func TestSeamAgent_RoutesAnInvocationMadeThroughAnAdapterHandle(t *testing.T) {
+	transport := &fakeHookTransport{reply: selectByID(routingPiGrokProfile().ID)}
+	routed := &recordingAgent{profile: routingPiGrokProfile()}
+	configured := &hangingAgent{name: "configured"}
+	run := testRouting(t, transport, []routing.Profile{routingPiGrokProfile()},
+		func(routing.Profile) (agent.Agent, error) { return routed, nil })
+
+	sctx := &StepContext{Ctx: context.Background(), Agent: configured, Routing: run}
+	handle := sctx.SeamAgent("intent-summarize")
+	if _, err := handle.Run(context.Background(), agent.RunOpts{Prompt: "summarize the transcript"}); err != nil {
+		t.Fatalf("run through the seam handle: %v", err)
+	}
+
+	routed.mu.Lock()
+	served := len(routed.prompts)
+	routed.mu.Unlock()
+	if served != 1 {
+		t.Fatalf("the selected profile served %d turns, want 1", served)
+	}
+	if configured.calls != 0 {
+		t.Fatal("the step's default agent must not serve a routed turn")
+	}
+
+	acquires := 0
+	for _, call := range transport.seen() {
+		if call.verb == routing.VerbAcquire {
+			acquires++
+		}
+	}
+	if acquires != 1 {
+		t.Fatalf("the handle made %d acquires, want exactly 1", acquires)
+	}
+	if len(transport.finishes()) != 1 {
+		t.Fatalf("the handle made %d finishes, want exactly 1", len(transport.finishes()))
+	}
+}
+
+// TestSeamAgent_CarriesItsDefaultPurposeToTheRouter proves an adapter handle
+// names the duty it serves, so a role-restricted configuration can admit or
+// refuse it deliberately rather than matching it against the empty role.
+func TestSeamAgent_CarriesItsDefaultPurposeToTheRouter(t *testing.T) {
+	summarizer := routingPiGrokProfile()
+	summarizer.Roles = []string{"intent-summarize"}
+
+	transport := &fakeHookTransport{reply: selectByID(summarizer.ID)}
+	run := testRouting(t, transport, []routing.Profile{summarizer},
+		func(p routing.Profile) (agent.Agent, error) { return &recordingAgent{profile: p}, nil })
+
+	sctx := &StepContext{Ctx: context.Background(), Agent: &hangingAgent{name: "configured"}, Routing: run}
+	if _, err := sctx.SeamAgent("intent-summarize").Run(context.Background(), agent.RunOpts{Prompt: "summarize"}); err != nil {
+		t.Fatalf("a profile restricted to this duty must serve it: %v", err)
+	}
+
+	// A handle for a duty the profile does not accept is refused, not quietly
+	// served by the step's default agent.
+	transport2 := &fakeHookTransport{reply: selectByID(summarizer.ID)}
+	run2 := testRouting(t, transport2, []routing.Profile{summarizer},
+		func(p routing.Profile) (agent.Agent, error) { return &recordingAgent{profile: p}, nil })
+	configured := &hangingAgent{name: "configured"}
+	sctx2 := &StepContext{Ctx: context.Background(), Agent: configured, Routing: run2}
+	_, err := sctx2.SeamAgent("intent-disambiguate").Run(context.Background(), agent.RunOpts{Prompt: "rerank"})
+	if !errors.Is(err, routing.ErrNoAllowedProfile) {
+		t.Fatalf("error %v must be ErrNoAllowedProfile", err)
+	}
+	if configured.calls != 0 {
+		t.Fatal("a refused route must never fall back to the step's default agent")
+	}
+}
+
+// TestRunAgent_UnnamedInvocationIsRefusedRatherThanRunUnrouted is the
+// configuration an operator reaches by role-restricting every profile, exactly
+// as the docs describe. An invocation that names no duty must fail closed with
+// the configuration error, never launch the step's own agent, which is how an
+// excluded route would get exercised anyway.
+func TestRunAgent_UnnamedInvocationIsRefusedRatherThanRunUnrouted(t *testing.T) {
+	restricted := routingPiGrokProfile()
+	restricted.Roles = []string{"review-fix"}
+
+	transport := &fakeHookTransport{reply: selectByID(restricted.ID)}
+	configured := &hangingAgent{name: "configured"}
+	run := testRouting(t, transport, []routing.Profile{restricted},
+		func(p routing.Profile) (agent.Agent, error) { return &recordingAgent{profile: p}, nil })
+
+	sctx := &StepContext{Ctx: context.Background(), Agent: configured, Routing: run}
+	_, err := sctx.RunAgent(agent.RunOpts{Prompt: "resolve the conflict"})
+	if !errors.Is(err, routing.ErrNoAllowedProfile) {
+		t.Fatalf("error %v must be ErrNoAllowedProfile", err)
+	}
+	if configured.calls != 0 {
+		t.Fatal("a refused route must never fall back to the step's default agent")
+	}
+	if len(transport.seen()) != 0 {
+		t.Fatal("a role with nothing approved must never reach the hook")
+	}
+}
+
+// TestAcquireRoute_HarnessThatProducesNoAgentFailsClosed proves the one
+// property buildRoutedAgent exists for cannot be lost silently. Launching the
+// bare adapter would hand a routed gate agent the step prompt with no phase
+// boundary, which is exactly the containment the wrapper carries.
+func TestAcquireRoute_HarnessThatProducesNoAgentFailsClosed(t *testing.T) {
+	transport := &fakeHookTransport{reply: selectByID(routingPiGrokProfile().ID)}
+	built := &recordingAgent{profile: routingPiGrokProfile()}
+	configured := &hangingAgent{name: "configured"}
+	run := testRouting(t, transport, []routing.Profile{routingPiGrokProfile()},
+		func(routing.Profile) (agent.Agent, error) { return built, nil })
+
+	sctx := &StepContext{
+		Ctx: context.Background(), Agent: configured, Routing: run,
+		WrapAgent: func(agent.Agent) agent.Agent { return nil },
+	}
+	_, err := sctx.RunAgent(agent.RunOpts{Prompt: "repair", Purpose: "review-fix"})
+	if err == nil {
+		t.Fatal("a harness that produces no agent must refuse the launch")
+	}
+	if !strings.Contains(err.Error(), "uncontained") {
+		t.Fatalf("error %q must name the containment refusal", err)
+	}
+	built.mu.Lock()
+	served := len(built.prompts)
+	built.mu.Unlock()
+	if served != 0 {
+		t.Fatal("the unwrapped adapter must never run")
+	}
+	if !built.wasClosed() {
+		t.Fatal("the adapter routing built must be closed when its launch is refused")
+	}
+	if configured.calls != 0 {
+		t.Fatal("a refused launch must never fall back to the step's default agent")
+	}
+	// The assignment must still be released, or the controller keeps counting
+	// a launch that never happened.
+	finishes := transport.finishes()
+	if len(finishes) != 1 {
+		t.Fatalf("want exactly one finish, got %d", len(finishes))
+	}
+	if finishes[0].Outcome != routing.OutcomeLaunchFailed {
+		t.Fatalf("outcome = %q, want launch-failed", finishes[0].Outcome)
+	}
+}

@@ -137,7 +137,8 @@ func (r *Router) Route(ctx context.Context, assignmentID, role string) (Assignme
 
 	allowed := r.allowedFor(role)
 	if len(allowed) == 0 {
-		return Assignment{}, false, fmt.Errorf("%w: role %q", ErrNoAllowedProfile, role)
+		return Assignment{}, false, fmt.Errorf("%w: %s. Configured profiles: %s. Either add this role to one profile's `roles`, or leave one profile unrestricted so it serves every role",
+			ErrNoAllowedProfile, describeRole(role), strings.Join(r.profileIDs(), ", "))
 	}
 
 	decision, err := r.hook.Acquire(ctx, Request{
@@ -213,6 +214,25 @@ func (r *Router) Finish(ctx context.Context, assignmentID string, outcome Outcom
 
 // allowedFor returns the approved profiles this role may use, sorted by id so
 // the offered set is stable across calls.
+// describeRole names the duty a refused invocation was serving. An unnamed
+// invocation reads as such rather than as an empty string an operator would
+// then try to add to a `roles` list.
+func describeRole(role string) string {
+	if role == "" {
+		return "this invocation reports no role, so only a profile with no `roles` restriction can serve it"
+	}
+	return fmt.Sprintf("role %q", role)
+}
+
+func (r *Router) profileIDs() []string {
+	ids := make([]string, 0, len(r.profiles))
+	for _, profile := range r.profiles {
+		ids = append(ids, profile.ID)
+	}
+	sort.Strings(ids)
+	return ids
+}
+
 func (r *Router) allowedFor(role string) []Profile {
 	out := make([]Profile, 0, len(r.profiles))
 	for _, profile := range r.profiles {

@@ -292,6 +292,16 @@ func TestProfileAllowedForRole(t *testing.T) {
 	if restricted.AllowedForRole("review") {
 		t.Fatal("a restricted profile must not serve an unlisted role")
 	}
+
+	// An unnamed invocation is served by unrestricted profiles only. A
+	// role-restricted profile is the operator's statement about one named
+	// duty, and an invocation that reports no duty is not that duty.
+	if !unrestricted.AllowedForRole("") {
+		t.Fatal("an unrestricted profile must serve an invocation that reports no role")
+	}
+	if restricted.AllowedForRole("") {
+		t.Fatal("a restricted profile must not serve an invocation that reports no role")
+	}
 }
 
 // TestNativeAgent_ExcludesOMP pins the adapter boundary the brief requires:

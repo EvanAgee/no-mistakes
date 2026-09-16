@@ -673,6 +673,28 @@ It is never a credential and never the account a proxy currently has selected: k
 `model` and `effort` are the same harness-neutral knobs as [`agent_config`](#agent_config), validated against what that harness can express.
 `roles`, when set, restricts the profile to those pipeline duties; omit it to allow every role.
 
+The complete role vocabulary is:
+
+| Role | The invocation it serves |
+| --- | --- |
+| `review` | the review analysis turn |
+| `review-fix` | the review fixer turn |
+| `test-evidence` | the Test step's live-validation turn |
+| `document` | the documentation pass |
+| `housekeeping` | the combined document-plus-lint pass, used when `commands.lint` is empty |
+| `lint` | the lint pass |
+| `rebase-conflict` | a rebase or merge conflict resolver |
+| `pr` | PR body drafting |
+| `pr-title` | PR title drafting, when a title pattern is configured |
+| `pr-template` | PR narrative drafting under a repository `pr.template` |
+| `ci-fix` | the CI repair turn |
+| `intent-summarize` | the intent step's transcript summarizer |
+| `intent-disambiguate` | the intent step's candidate reranker |
+| `<step>-fix` | a step's own fixer turn, for example `test-fix` or `lint-fix`; repository gates use `gate.<anchor>.<label>-fix` |
+
+A role no profile accepts fails that invocation with a configuration error naming the role, rather than falling back to your default agent.
+Leave at least one profile unrestricted unless you intend to enumerate every role above.
+
 Routing supersedes [`review_agents`](#review_agents) for every turn it serves.
 `review_agents` picks the reviewer and the fixer by the adapter you configured for each duty, but a routed turn runs whichever approved profile the hook selected, so that split no longer applies and one service can both prescribe and certify the same fixes.
 If you enable assignment and want the reviewer and the fixer kept independent, express that split again through per-profile `roles`: give the reviewing profiles `roles: [review]` and the fixing profiles the fix roles, so no profile is admissible for both.

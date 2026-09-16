@@ -452,6 +452,7 @@ Final diff paths and statuses:
 		CWD:        sctx.WorkDir,
 		JSONSchema: prContentSchema,
 		OnChunk:    sctx.LogChunk,
+		Purpose:    "pr",
 	})
 	if err != nil {
 		slog.Warn("agent failed for PR content, using fallback", "error", err)
@@ -515,6 +516,7 @@ Final diff paths and statuses:
 		CWD:        sctx.WorkDir,
 		JSONSchema: prTitleSchema,
 		OnChunk:    sctx.LogChunk,
+		Purpose:    "pr-title",
 	})
 	if err != nil {
 		return "", fmt.Errorf("draft configured PR title: %w", err)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync/atomic"
 
 	"github.com/kunchenguid/no-mistakes/internal/agent"
@@ -181,7 +182,8 @@ func (sctx *StepContext) buildRoutedAgent(profile routing.Profile) (agent.Agent,
 	}
 	wrapped := sctx.WrapAgent(built)
 	if wrapped == nil {
-		return built, nil
+		_ = built.Close()
+		return nil, fmt.Errorf("the step harness produced no agent for profile %s; refusing to launch it uncontained", profile.ID)
 	}
 	return wrapped, nil
 }
@@ -232,11 +234,23 @@ func (sctx *StepContext) routingContext() context.Context {
 
 // finish closes an assignment exactly once. A second call is a no-op, so a
 // deferred cleanup and an explicit report cannot double-close.
+// A finish that never reaches the hook is never fatal to the turn, which has
+// already happened, but it must not be silent either: the router spends the id
+// locally before it calls out, so this is the only moment the failure exists.
+// The controller is left counting that route as in flight, which biases every
+// later acquire for every caller on this machine, and an operator seeing only
+// degraded balancing has no way back to the cause.
 func (r *RunRouting) finish(ctx context.Context, invocation *routedInvocation, outcome routing.Outcome) {
 	if r == nil || invocation == nil || !invocation.closed.CompareAndSwap(false, true) {
 		return
 	}
-	_ = r.router.Finish(ctx, invocation.assignment.ID, outcome)
+	if err := r.router.Finish(ctx, invocation.assignment.ID, outcome); err != nil {
+		slog.Warn("failed to report a routing assignment as finished; the controller may keep counting it as running",
+			"assignment", invocation.assignment.ID,
+			"profile", invocation.assignment.Profile.ID,
+			"outcome", string(outcome),
+			"error", err)
+	}
 }
 
 func describeModel(p routing.Profile) string {
