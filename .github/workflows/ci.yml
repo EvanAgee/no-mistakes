@@ -10,6 +10,11 @@ on:
     paths-ignore:
       - .release-please-manifest.json
       - CHANGELOG.md
+  # Manual trigger so a branch can be validated without a pull_request event.
+  # A fork whose workflows registered after its pull request was opened receives
+  # no pull_request run for that pull request, which leaves the Windows matrix
+  # jobs unexercised; dispatching by ref runs the same suite on the same head.
+  workflow_dispatch:
 
 jobs:
   check:
