@@ -5,17 +5,17 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
 	"os/exec"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"testing"
 	"time"
 
 	"github.com/kunchenguid/no-mistakes/internal/agent"
 	"github.com/kunchenguid/no-mistakes/internal/config"
+	"github.com/kunchenguid/no-mistakes/internal/e2edaemon"
 	"github.com/kunchenguid/no-mistakes/internal/gateguidance"
 	"github.com/kunchenguid/no-mistakes/internal/routing"
 	"github.com/kunchenguid/no-mistakes/internal/types"
@@ -602,14 +602,14 @@ func TestRunAgent_SwitchingServiceNeverInterruptsARunningProcess(t *testing.T) {
 		t.Fatalf("routed turn: %v", err)
 	}
 
-	if !processAlive(longRunning.Process.Pid) {
+	if !processAlive(t, longRunning.Process.Pid) {
 		t.Fatal("routing a later invocation elsewhere must not interrupt a process already running")
 	}
 
-	// It is not merely unkilled: it is still a healthy child that terminates
-	// on its own terms.
-	if err := longRunning.Process.Signal(syscall.SIGTERM); err != nil {
-		t.Fatalf("the surviving process must still be signalable: %v", err)
+	// It is not merely unkilled: it is still a healthy child this test can
+	// direct. Kill rather than SIGTERM because Windows supports no signals.
+	if err := longRunning.Process.Kill(); err != nil {
+		t.Fatalf("the surviving process must still be controllable: %v", err)
 	}
 	_ = longRunning.Wait()
 }
@@ -620,20 +620,29 @@ func TestRunAgent_SwitchingServiceNeverInterruptsARunningProcess(t *testing.T) {
 func startSleeper(t *testing.T, seconds int) *exec.Cmd {
 	t.Helper()
 	cmd := exec.Command("sleep", fmt.Sprint(seconds))
+	if runtime.GOOS == "windows" {
+		// Windows ships no sleep binary. ping waits one second BETWEEN echoes,
+		// so n+1 echoes span n seconds, and a 0-second sleeper stays a single
+		// immediate echo that exits on its own like its Unix counterpart.
+		cmd = exec.Command("ping", "-n", fmt.Sprint(seconds+1), "127.0.0.1")
+	}
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start sleeper: %v", err)
 	}
 	return cmd
 }
 
-// processAlive reports whether a pid is still running. Signal 0 performs the
-// permission and existence checks without delivering anything.
-func processAlive(pid int) bool {
-	proc, err := os.FindProcess(pid)
+// processAlive reports whether a pid is still running. A signal-zero probe is
+// POSIX-only and os.FindProcess never fails on Windows, so this defers to the
+// repository's existing cross-platform check, which also refuses to count an
+// exited-but-unreaped child as alive.
+func processAlive(t *testing.T, pid int) bool {
+	t.Helper()
+	alive, err := e2edaemon.ProcessAlive(pid)
 	if err != nil {
-		return false
+		t.Fatalf("probe pid %d: %v", pid, err)
 	}
-	return proc.Signal(syscall.Signal(0)) == nil
+	return alive
 }
 
 // TestRunAgent_PanicStillReleasesTheAssignment proves the backstop. If a panic
