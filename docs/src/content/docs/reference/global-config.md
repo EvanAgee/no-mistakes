@@ -671,6 +671,7 @@ Each profile needs an `id` unique to this file, an `agent`, and a `provider`.
 `provider` is your own stable label for the billing route, such as `anthropic-subscription` or `vercel-ai-gateway`.
 It is never a credential and never the account a proxy currently has selected: keep it unchanged across token and account rotation, or every rotation throws away a reusable session.
 `model` and `effort` are the same harness-neutral knobs as [`agent_config`](#agent_config), validated against what that harness can express.
+`model` is optional, but leaving it out costs session reuse: a profile with no explicit model never resumes a session and always starts a fresh one, because two profiles naming the same adapter cannot then be proven to serve the same model. no-mistakes logs one warning per such profile at config load. Set `model` on a profile whose turns should reuse their session.
 `roles`, when set, restricts the profile to those pipeline duties; omit it to allow every role.
 
 The complete role vocabulary is:
@@ -700,8 +701,9 @@ Routing supersedes [`review_agents`](#review_agents) for every turn it serves.
 If you enable assignment and want the reviewer and the fixer kept independent, express that split again through per-profile `roles`: give the reviewing profiles `roles: [review]` and the fixing profiles the fix roles, so no profile is admissible for both.
 
 Session reuse follows the profile, not the adapter name.
-Consecutive turns on the same profile resume the same native session; a turn on a different profile always starts a fresh one, because a session id belongs to the exact service that minted it.
+Consecutive turns on the same profile resume the same native session, provided that profile sets an explicit `model`; a turn on a different profile always starts a fresh one, because a session id belongs to the exact service that minted it.
 Two `pi` profiles are a different service in this sense even though they share a binary.
+A profile with no `model` has no identity to match, so every turn it serves starts fresh no matter how many run consecutively.
 Runs parked by an earlier version keep working: their sessions have no recorded profile, so they resume normally while routing is off and start fresh once routing is on.
 
 ### worktree_roots

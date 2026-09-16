@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"log/slog"
 	"sort"
 	"strings"
 	"time"
@@ -114,6 +115,7 @@ func parseAssignment(raw assignmentRaw) (Assignment, error) {
 			return Assignment{}, fmt.Errorf("invalid assignment.profiles[%d]: duplicate profile id %q", i, profile.ID)
 		}
 		seen[profile.ID] = struct{}{}
+		warnIfProfileCannotReuseSessions(profile)
 		out.Profiles = append(out.Profiles, profile)
 	}
 
@@ -124,6 +126,31 @@ func parseAssignment(raw assignmentRaw) (Assignment, error) {
 		return Assignment{}, fmt.Errorf("invalid assignment: assignment.hook_path is set but no profiles are configured, so the hook has nothing it may select")
 	}
 	return out, nil
+}
+
+// warnIfProfileCannotReuseSessions tells the operator, once per affected
+// profile at config load, that this profile will never reuse a session.
+//
+// Leaving the model to the harness default stays legal: an operator who does
+// not care about reuse should not have to name one. But it is not free, and
+// nothing else says so. routing.ProfileKey returns an empty key when the model
+// is unset, because two profiles naming one adapter cannot then be proven to
+// serve the same model, and an unknown identity never matches anything. Every
+// turn that profile serves therefore starts a fresh session and persists
+// nothing, for the whole life of every run, and the only other signal is a
+// per-turn log line an operator is unlikely to trace back to this omission.
+//
+// The condition is asked of ProfileKey itself rather than restated here, so a
+// later change to what makes an identity knowable cannot leave this warning
+// describing a rule the key no longer follows.
+func warnIfProfileCannotReuseSessions(profile routing.Profile) {
+	if routing.ProfileKey(profile) != "" {
+		return
+	}
+	slog.Warn("assignment profile has no explicit model, so session reuse is disabled for it: every turn it serves starts a fresh session. Set `model` on this profile to reuse sessions across its turns.",
+		"profile", profile.ID,
+		"agent", string(profile.Agent),
+		"provider", profile.Provider)
 }
 
 func parseAssignmentDuration(field, raw string) (time.Duration, error) {

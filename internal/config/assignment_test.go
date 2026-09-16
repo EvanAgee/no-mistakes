@@ -1,11 +1,14 @@
 package config
 
 import (
+	"bytes"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/kunchenguid/no-mistakes/internal/agentcfg"
+	"github.com/kunchenguid/no-mistakes/internal/routing"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
 
@@ -284,5 +287,145 @@ func TestAssignment_NormalizeRolesIsOrderInsensitive(t *testing.T) {
 	}
 	if got := normalizeRoles([]string{"", "  "}); got != nil {
 		t.Fatalf("a list of blanks must normalize to no restriction, got %v", got)
+	}
+}
+
+// captureConfigWarnings redirects the default logger for one call and returns
+// what was logged at warn level or above.
+func captureConfigWarnings(t *testing.T, load func()) string {
+	t.Helper()
+	var logs bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+	load()
+	return logs.String()
+}
+
+// TestAssignment_ModellessProfileLoadsButWarnsThatReuseIsOff proves the
+// documented contract for a profile that leaves the model to the harness
+// default: it stays legal, and the operator is told exactly once, by name,
+// that it will never reuse a session.
+//
+// Without the warning this is silent. routing.ProfileKey returns an empty key
+// for such a profile, an empty key never matches anything, so every turn it
+// serves starts fresh and persists nothing for the whole life of every run.
+// The only other signal is a per-turn log line an operator is unlikely to
+// trace back to a missing `model`.
+func TestAssignment_ModellessProfileLoadsButWarnsThatReuseIsOff(t *testing.T) {
+	const body = `
+assignment:
+  hook_path: /usr/local/bin/fm-route.sh
+  profiles:
+    - id: claude-opus
+      agent: claude
+      provider: anthropic-subscription
+      effort: xhigh
+    - id: codex-sol
+      agent: codex
+      provider: openai-subscription
+      model: gpt-5.6-sol
+`
+	var cfg *GlobalConfig
+	var err error
+	logs := captureConfigWarnings(t, func() {
+		cfg, err = loadAssignmentYAML(t, body)
+	})
+
+	// Required change 1: this configuration must still load.
+	if err != nil {
+		t.Fatalf("a model-less profile must stay legal, got error: %v", err)
+	}
+	if got := len(cfg.Assignment.Profiles); got != 2 {
+		t.Fatalf("parsed %d profiles, want 2", got)
+	}
+
+	// Required change 2: exactly one warning, naming the affected profile.
+	if strings.Count(logs, "session reuse is disabled") != 1 {
+		t.Fatalf("want exactly one reuse warning, got logs:\n%s", logs)
+	}
+	if !strings.Contains(logs, "claude-opus") {
+		t.Fatalf("the warning must name the affected profile, got logs:\n%s", logs)
+	}
+	if strings.Contains(logs, "codex-sol") {
+		t.Fatalf("the profile that sets a model must not be warned about, got logs:\n%s", logs)
+	}
+
+	// The warning describes a real consequence: that profile has no identity
+	// to match, while its sibling does.
+	if key := routing.ProfileKey(cfg.Assignment.Profiles[0]); key != "" {
+		t.Fatalf("the model-less profile must have no identity, got %q", key)
+	}
+	if key := routing.ProfileKey(cfg.Assignment.Profiles[1]); key == "" {
+		t.Fatal("the profile with a model must have an identity")
+	}
+}
+
+// TestAssignment_ProfilesWithModelsLoadWithoutAReuseWarning proves the warning
+// is scoped to the case it describes and does not fire on the documented
+// configuration.
+func TestAssignment_ProfilesWithModelsLoadWithoutAReuseWarning(t *testing.T) {
+	const body = `
+assignment:
+  hook_path: /usr/local/bin/fm-route.sh
+  profiles:
+    - id: claude-opus
+      agent: claude
+      provider: anthropic-subscription
+      model: opus
+      effort: xhigh
+    - id: pi-grok
+      agent: pi
+      provider: xai-subscription
+      model: xai/grok-4.6
+`
+	var err error
+	logs := captureConfigWarnings(t, func() {
+		_, err = loadAssignmentYAML(t, body)
+	})
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if strings.Contains(logs, "session reuse is disabled") {
+		t.Fatalf("profiles that set a model must not be warned about, got logs:\n%s", logs)
+	}
+}
+
+// TestAssignment_EveryModellessProfileIsWarnedAboutByName proves the warning is
+// per profile rather than one summary, so an operator fixing a multi-profile
+// configuration is told about each one.
+func TestAssignment_EveryModellessProfileIsWarnedAboutByName(t *testing.T) {
+	const body = `
+assignment:
+  hook_path: /usr/local/bin/fm-route.sh
+  profiles:
+    - id: claude-default
+      agent: claude
+      provider: anthropic-subscription
+    - id: codex-default
+      agent: codex
+      provider: openai-subscription
+    - id: pi-grok
+      agent: pi
+      provider: xai-subscription
+      model: xai/grok-4.6
+`
+	var err error
+	logs := captureConfigWarnings(t, func() {
+		_, err = loadAssignmentYAML(t, body)
+	})
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if got := strings.Count(logs, "session reuse is disabled"); got != 2 {
+		t.Fatalf("want one warning per model-less profile (2), got %d; logs:\n%s", got, logs)
+	}
+	for _, id := range []string{"claude-default", "codex-default"} {
+		if !strings.Contains(logs, id) {
+			t.Fatalf("profile %q was not named in the warnings, got logs:\n%s", id, logs)
+		}
+	}
+	if strings.Contains(logs, "pi-grok") {
+		t.Fatalf("the profile that sets a model must not be warned about, got logs:\n%s", logs)
 	}
 }
