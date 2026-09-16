@@ -766,7 +766,8 @@ func (e *Executor) autoFixLimit(stepName types.StepName) int {
 // boundary that stops a gate agent starting a second pipeline, lifecycle
 // events, and the run's perf record. It lives here rather than inline so every
 // StepContext that carries Routing can hand routing the identical stack; a
-// context that carries Routing without one is refused (see buildRoutedAgent).
+// context that carries Routing without a harness refuses the routed launch
+// rather than running it bare (see buildRoutedAgent).
 func (e *Executor) stepAgentHarness(runID string, stepName types.StepName, onLifecycle func(agent.LifecycleEvent), round func() int) func(agent.Agent) agent.Agent {
 	return func(inner agent.Agent) agent.Agent {
 		if inner == nil {

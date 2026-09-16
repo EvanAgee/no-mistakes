@@ -208,13 +208,17 @@ func (sctx *StepContext) acquireRoute(ctx context.Context, opts *agent.RunOpts, 
 // run's only record that the launch happened at all. Routing decides WHICH
 // service serves a turn and nothing else about how that turn runs, so a routed
 // adapter must be wrapped exactly like the default one.
+//
+// A missing harness and a harness that produces nothing are the same hazard -
+// an adapter about to run uncontained - so both refuse rather than downgrade.
 func (sctx *StepContext) buildRoutedAgent(profile routing.Profile) (agent.Agent, error) {
 	built, err := sctx.Routing.newAgent(profile)
 	if err != nil {
 		return nil, err
 	}
 	if sctx.WrapAgent == nil {
-		return built, nil
+		_ = built.Close()
+		return nil, fmt.Errorf("the step context carries routing but no step harness for profile %s; refusing to launch it uncontained", profile.ID)
 	}
 	wrapped := sctx.WrapAgent(built)
 	if wrapped == nil {

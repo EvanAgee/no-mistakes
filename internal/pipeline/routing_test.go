@@ -57,6 +57,18 @@ func (f *fakeHookTransport) finishes() []routing.Request {
 	return out
 }
 
+// testStepHarness is the stand-in for the executor's own invocation stack. A
+// StepContext that carries Routing must supply a harness or the routed launch
+// is refused, so a test that is not itself about the harness still needs one.
+// It wraps in the gate phase boundary, which is the containment a routed
+// adapter must never run without.
+func testStepHarness(inner agent.Agent) agent.Agent {
+	if inner == nil {
+		return nil
+	}
+	return &gateStepBoundaryAgent{inner: inner, phase: types.StepReview}
+}
+
 // testRouting builds a RunRouting whose hook is driven by transport and whose
 // adapters come from newAgent, mirroring how the daemon wires the real thing.
 func testRouting(t *testing.T, transport *fakeHookTransport, profiles []routing.Profile,
@@ -182,10 +194,11 @@ func TestRunAgent_RoutedInvocationLaunchesTheSelectedProfileAndReportsIt(t *test
 	configured := &hangingAgent{name: "configured"}
 	var logged []string
 	sctx := &StepContext{
-		Ctx:     context.Background(),
-		Agent:   configured,
-		Routing: run,
-		Log:     func(message string) { logged = append(logged, message) },
+		Ctx:       context.Background(),
+		Agent:     configured,
+		Routing:   run,
+		WrapAgent: testStepHarness,
+		Log:       func(message string) { logged = append(logged, message) },
 	}
 
 	prompt := "fix finding F-1 in worktree /w/run-1"
@@ -193,8 +206,14 @@ func TestRunAgent_RoutedInvocationLaunchesTheSelectedProfileAndReportsIt(t *test
 		t.Fatalf("run: %v", err)
 	}
 
-	if len(grok.prompts) != 1 || grok.prompts[0] != prompt {
-		t.Fatalf("the selected profile must serve the exact phase prompt, got %v", grok.prompts)
+	if len(grok.prompts) != 1 {
+		t.Fatalf("the selected profile must serve exactly one turn, got %v", grok.prompts)
+	}
+	if !strings.HasSuffix(grok.prompts[0], prompt) {
+		t.Fatalf("the selected profile must serve the exact phase prompt, got %q", grok.prompts[0])
+	}
+	if !strings.HasPrefix(grok.prompts[0], gateguidance.PromptBoundary(string(types.StepReview))) {
+		t.Fatalf("the routed launch must carry the gate phase boundary, got %q", grok.prompts[0])
 	}
 	if configured.calls != 0 {
 		t.Fatal("a routed invocation must not also run the step's configured agent")
@@ -278,7 +297,7 @@ func TestRunAgent_RoutingFailureNeverLaunchesAnExcludedRoute(t *testing.T) {
 				})
 
 			configured := &hangingAgent{name: "configured"}
-			sctx := &StepContext{Ctx: context.Background(), Agent: configured, Routing: run}
+			sctx := &StepContext{Ctx: context.Background(), Agent: configured, Routing: run, WrapAgent: testStepHarness}
 
 			_, err := sctx.RunAgent(agent.RunOpts{Prompt: "fix", Purpose: "review-fix"})
 			if err == nil {
@@ -309,7 +328,7 @@ func TestRunAgent_DeferredInvocationStaysRetryable(t *testing.T) {
 	run := testRouting(t, transport, []routing.Profile{routingPiGrokProfile()},
 		func(p routing.Profile) (agent.Agent, error) { return &recordingAgent{profile: p}, nil })
 
-	sctx := &StepContext{Ctx: context.Background(), Agent: &hangingAgent{name: "configured"}, Routing: run}
+	sctx := &StepContext{Ctx: context.Background(), Agent: &hangingAgent{name: "configured"}, Routing: run, WrapAgent: testStepHarness}
 	_, err := sctx.RunAgent(agent.RunOpts{Prompt: "fix", Purpose: "review-fix"})
 	if !errors.Is(err, routing.ErrDeferred) {
 		t.Fatalf("a deferral must surface as ErrDeferred, got %v", err)
@@ -331,7 +350,7 @@ func TestRunAgent_FailedLaunchIsReportedAsLaunchFailed(t *testing.T) {
 		})
 
 	configured := &hangingAgent{name: "configured"}
-	sctx := &StepContext{Ctx: context.Background(), Agent: configured, Routing: run}
+	sctx := &StepContext{Ctx: context.Background(), Agent: configured, Routing: run, WrapAgent: testStepHarness}
 
 	_, err := sctx.RunAgent(agent.RunOpts{Prompt: "fix", Purpose: "review-fix"})
 	if err == nil || !strings.Contains(err.Error(), "create routed agent") {
@@ -385,7 +404,7 @@ func TestRunAgent_FailureAndTimeoutAreReportedAsFailed(t *testing.T) {
 
 			sctx := &StepContext{
 				Ctx: context.Background(), Agent: &hangingAgent{name: "configured"},
-				Routing: run, Config: tc.cfg,
+				Routing: run, Config: tc.cfg, WrapAgent: testStepHarness,
 			}
 			if _, err := sctx.RunAgent(agent.RunOpts{Prompt: "fix", Purpose: "review-fix"}); err == nil {
 				t.Fatal("want the invocation to fail")
@@ -417,7 +436,7 @@ func TestRunAgent_CancelledInvocationIsStillReported(t *testing.T) {
 		})
 
 	ctx, cancel := context.WithCancel(context.Background())
-	sctx := &StepContext{Ctx: ctx, Agent: &hangingAgent{name: "configured"}, Routing: run}
+	sctx := &StepContext{Ctx: ctx, Agent: &hangingAgent{name: "configured"}, Routing: run, WrapAgent: testStepHarness}
 
 	go func() {
 		time.Sleep(20 * time.Millisecond)
@@ -460,7 +479,7 @@ func TestRunAgent_EachInvocationIsItsOwnAssignment(t *testing.T) {
 		return &recordingAgent{profile: p}, nil
 	})
 
-	sctx := &StepContext{Ctx: context.Background(), Agent: &hangingAgent{name: "configured"}, Routing: run}
+	sctx := &StepContext{Ctx: context.Background(), Agent: &hangingAgent{name: "configured"}, Routing: run, WrapAgent: testStepHarness}
 	for i := range order {
 		if _, err := sctx.RunAgent(agent.RunOpts{
 			Prompt: fmt.Sprintf("fix round %d", i+1), Purpose: "review-fix",
@@ -502,7 +521,7 @@ func TestRunAgent_RoutedAgentIsClosedAndTheConfiguredOneSurvives(t *testing.T) {
 		func(routing.Profile) (agent.Agent, error) { return routed, nil })
 
 	configured := &hangingAgent{name: "configured"}
-	sctx := &StepContext{Ctx: context.Background(), Agent: configured, Routing: run}
+	sctx := &StepContext{Ctx: context.Background(), Agent: configured, Routing: run, WrapAgent: testStepHarness}
 
 	if _, err := sctx.RunAgent(agent.RunOpts{Prompt: "fix", Purpose: "review-fix"}); err != nil {
 		t.Fatalf("run: %v", err)
@@ -533,7 +552,7 @@ func TestRunAgent_RoleRestrictionReachesTheController(t *testing.T) {
 	run := testRouting(t, transport, []routing.Profile{fixerOnly, reviewerOnly},
 		func(p routing.Profile) (agent.Agent, error) { return &recordingAgent{profile: p}, nil })
 
-	sctx := &StepContext{Ctx: context.Background(), Agent: &hangingAgent{name: "configured"}, Routing: run}
+	sctx := &StepContext{Ctx: context.Background(), Agent: &hangingAgent{name: "configured"}, Routing: run, WrapAgent: testStepHarness}
 	if _, err := sctx.RunAgent(agent.RunOpts{Prompt: "review", Purpose: "review"}); err != nil {
 		t.Fatalf("run: %v", err)
 	}
@@ -571,7 +590,7 @@ func TestRunAgent_SwitchingServiceNeverInterruptsARunningProcess(t *testing.T) {
 			}}, nil
 		})
 
-	sctx := &StepContext{Ctx: context.Background(), Agent: &hangingAgent{name: "configured"}, Routing: run}
+	sctx := &StepContext{Ctx: context.Background(), Agent: &hangingAgent{name: "configured"}, Routing: run, WrapAgent: testStepHarness}
 	if _, err := sctx.RunAgent(agent.RunOpts{Prompt: "fix on the new service", Purpose: "review-fix"}); err != nil {
 		t.Fatalf("routed turn: %v", err)
 	}
@@ -623,7 +642,7 @@ func TestRunAgent_PanicStillReleasesTheAssignment(t *testing.T) {
 			}}, nil
 		})
 
-	sctx := &StepContext{Ctx: context.Background(), Agent: &hangingAgent{name: "configured"}, Routing: run}
+	sctx := &StepContext{Ctx: context.Background(), Agent: &hangingAgent{name: "configured"}, Routing: run, WrapAgent: testStepHarness}
 
 	func() {
 		defer func() {
@@ -651,7 +670,7 @@ func TestRunAgent_NormalOutcomeWinsOverTheBackstop(t *testing.T) {
 	run := testRouting(t, transport, []routing.Profile{routingPiGrokProfile()},
 		func(p routing.Profile) (agent.Agent, error) { return &recordingAgent{profile: p}, nil })
 
-	sctx := &StepContext{Ctx: context.Background(), Agent: &hangingAgent{name: "configured"}, Routing: run}
+	sctx := &StepContext{Ctx: context.Background(), Agent: &hangingAgent{name: "configured"}, Routing: run, WrapAgent: testStepHarness}
 	if _, err := sctx.RunAgent(agent.RunOpts{Prompt: "fix", Purpose: "review-fix"}); err != nil {
 		t.Fatalf("run: %v", err)
 	}
@@ -687,7 +706,7 @@ func TestRunAgent_AlreadyClosedAssignmentNeverLaunches(t *testing.T) {
 		})
 
 	configured := &hangingAgent{name: "configured"}
-	sctx := &StepContext{Ctx: context.Background(), Agent: configured, Routing: run}
+	sctx := &StepContext{Ctx: context.Background(), Agent: configured, Routing: run, WrapAgent: testStepHarness}
 
 	_, err := sctx.RunAgent(agent.RunOpts{Prompt: "fix", Purpose: "review-fix"})
 	if !errors.Is(err, routing.ErrAlreadyClosed) {
@@ -736,7 +755,7 @@ func TestRunAgent_OnlySelectedAuthorizesALaunch(t *testing.T) {
 				})
 
 			configured := &hangingAgent{name: "configured"}
-			sctx := &StepContext{Ctx: context.Background(), Agent: configured, Routing: run}
+			sctx := &StepContext{Ctx: context.Background(), Agent: configured, Routing: run, WrapAgent: testStepHarness}
 
 			if _, err := sctx.RunAgent(agent.RunOpts{Prompt: "fix", Purpose: "review-fix"}); err == nil {
 				t.Fatal("a reply that is not selected must fail the invocation")
@@ -761,7 +780,7 @@ func TestRunAgent_EveryLaunchUsesItsOwnAssignmentID(t *testing.T) {
 	run := testRouting(t, transport, []routing.Profile{routingPiGrokProfile()},
 		func(p routing.Profile) (agent.Agent, error) { return &recordingAgent{profile: p}, nil })
 
-	sctx := &StepContext{Ctx: context.Background(), Agent: &hangingAgent{name: "configured"}, Routing: run}
+	sctx := &StepContext{Ctx: context.Background(), Agent: &hangingAgent{name: "configured"}, Routing: run, WrapAgent: testStepHarness}
 	const launches = 4
 	for i := range launches {
 		if _, err := sctx.RunAgent(agent.RunOpts{
@@ -836,10 +855,13 @@ func TestRunAgent_RoutedAdapterKeepsTheStepInvocationHarness(t *testing.T) {
 	}
 }
 
-// TestRunAgent_UnwrappedStepContextStillRoutes keeps the harness optional, so
-// an embedding that builds its own agent and supplies no WrapAgent still gets a
-// routed launch rather than an error or a silent default-agent launch.
-func TestRunAgent_UnwrappedStepContextStillRoutes(t *testing.T) {
+// TestRunAgent_StepContextWithRoutingButNoHarnessRefusesTheLaunch is the other
+// half of the containment rule. A missing harness leaves a routed adapter
+// exactly as uncontained as a harness that returned nothing: no gate phase
+// boundary, no lifecycle events, no perf record and no backstop deadline. Both
+// must refuse, and a refused launch must never fall through to the step's own
+// agent, which would put the turn on a route the controller did not admit.
+func TestRunAgent_StepContextWithRoutingButNoHarnessRefusesTheLaunch(t *testing.T) {
 	transport := &fakeHookTransport{reply: selectByID(routingPiGrokProfile().ID)}
 	routed := &recordingAgent{profile: routingPiGrokProfile()}
 	configured := &hangingAgent{name: "configured"}
@@ -847,14 +869,24 @@ func TestRunAgent_UnwrappedStepContextStillRoutes(t *testing.T) {
 		func(routing.Profile) (agent.Agent, error) { return routed, nil })
 
 	sctx := &StepContext{Ctx: context.Background(), Agent: configured, Routing: run}
-	if _, err := sctx.RunAgent(agent.RunOpts{Prompt: "repair", Purpose: "review-fix"}); err != nil {
-		t.Fatalf("run: %v", err)
+	_, err := sctx.RunAgent(agent.RunOpts{Prompt: "repair", Purpose: "review-fix"})
+	if err == nil {
+		t.Fatal("a routing-carrying context with no harness must refuse the launch")
+	}
+	if !strings.Contains(err.Error(), "uncontained") {
+		t.Fatalf("error %q must name the containment refusal", err)
 	}
 	routed.mu.Lock()
 	served := len(routed.prompts)
 	routed.mu.Unlock()
-	if served != 1 {
-		t.Fatalf("routed adapter served %d turns, want 1", served)
+	if served != 0 {
+		t.Fatalf("the unwrapped adapter must never run, served %d turns", served)
+	}
+	if !routed.wasClosed() {
+		t.Fatal("the adapter routing built must be closed when its launch is refused")
+	}
+	if configured.calls != 0 {
+		t.Fatal("a refused launch must never fall back to the step's default agent")
 	}
 }
 
@@ -872,7 +904,7 @@ func TestRunAgent_AssignmentIDsDoNotRepeatAcrossADaemonRestart(t *testing.T) {
 		transport := &fakeHookTransport{reply: selectByID(routingPiGrokProfile().ID)}
 		run := testRoutingForGeneration(t, transport, []routing.Profile{routingPiGrokProfile()},
 			func(p routing.Profile) (agent.Agent, error) { return &recordingAgent{profile: p}, nil }, generation)
-		sctx := &StepContext{Ctx: context.Background(), Agent: &hangingAgent{name: "configured"}, Routing: run}
+		sctx := &StepContext{Ctx: context.Background(), Agent: &hangingAgent{name: "configured"}, Routing: run, WrapAgent: testStepHarness}
 		for i := range 3 {
 			if _, err := sctx.RunAgent(agent.RunOpts{
 				Prompt: fmt.Sprintf("fix round %d", i+1), Purpose: "review-fix",
@@ -914,7 +946,7 @@ func TestRunAgent_OwnerIdentityAndGenerationReachTheController(t *testing.T) {
 	run := testRouting(t, transport, []routing.Profile{routingPiGrokProfile()},
 		func(p routing.Profile) (agent.Agent, error) { return &recordingAgent{profile: p}, nil })
 
-	sctx := &StepContext{Ctx: context.Background(), Agent: &hangingAgent{name: "configured"}, Routing: run}
+	sctx := &StepContext{Ctx: context.Background(), Agent: &hangingAgent{name: "configured"}, Routing: run, WrapAgent: testStepHarness}
 	if _, err := sctx.RunAgent(agent.RunOpts{Prompt: "fix", Purpose: "review-fix"}); err != nil {
 		t.Fatalf("run: %v", err)
 	}
@@ -968,7 +1000,7 @@ func TestSeamAgent_RoutesAnInvocationMadeThroughAnAdapterHandle(t *testing.T) {
 	run := testRouting(t, transport, []routing.Profile{routingPiGrokProfile()},
 		func(routing.Profile) (agent.Agent, error) { return routed, nil })
 
-	sctx := &StepContext{Ctx: context.Background(), Agent: configured, Routing: run}
+	sctx := &StepContext{Ctx: context.Background(), Agent: configured, Routing: run, WrapAgent: testStepHarness}
 	handle := sctx.SeamAgent("intent-summarize")
 	if _, err := handle.Run(context.Background(), agent.RunOpts{Prompt: "summarize the transcript"}); err != nil {
 		t.Fatalf("run through the seam handle: %v", err)
@@ -1009,7 +1041,7 @@ func TestSeamAgent_CarriesItsDefaultPurposeToTheRouter(t *testing.T) {
 	run := testRouting(t, transport, []routing.Profile{summarizer},
 		func(p routing.Profile) (agent.Agent, error) { return &recordingAgent{profile: p}, nil })
 
-	sctx := &StepContext{Ctx: context.Background(), Agent: &hangingAgent{name: "configured"}, Routing: run}
+	sctx := &StepContext{Ctx: context.Background(), Agent: &hangingAgent{name: "configured"}, Routing: run, WrapAgent: testStepHarness}
 	if _, err := sctx.SeamAgent("intent-summarize").Run(context.Background(), agent.RunOpts{Prompt: "summarize"}); err != nil {
 		t.Fatalf("a profile restricted to this duty must serve it: %v", err)
 	}
@@ -1020,7 +1052,7 @@ func TestSeamAgent_CarriesItsDefaultPurposeToTheRouter(t *testing.T) {
 	run2 := testRouting(t, transport2, []routing.Profile{summarizer},
 		func(p routing.Profile) (agent.Agent, error) { return &recordingAgent{profile: p}, nil })
 	configured := &hangingAgent{name: "configured"}
-	sctx2 := &StepContext{Ctx: context.Background(), Agent: configured, Routing: run2}
+	sctx2 := &StepContext{Ctx: context.Background(), Agent: configured, Routing: run2, WrapAgent: testStepHarness}
 	_, err := sctx2.SeamAgent("intent-disambiguate").Run(context.Background(), agent.RunOpts{Prompt: "rerank"})
 	if !errors.Is(err, routing.ErrNoAllowedProfile) {
 		t.Fatalf("error %v must be ErrNoAllowedProfile", err)
@@ -1044,7 +1076,7 @@ func TestRunAgent_UnnamedInvocationIsRefusedRatherThanRunUnrouted(t *testing.T) 
 	run := testRouting(t, transport, []routing.Profile{restricted},
 		func(p routing.Profile) (agent.Agent, error) { return &recordingAgent{profile: p}, nil })
 
-	sctx := &StepContext{Ctx: context.Background(), Agent: configured, Routing: run}
+	sctx := &StepContext{Ctx: context.Background(), Agent: configured, Routing: run, WrapAgent: testStepHarness}
 	_, err := sctx.RunAgent(agent.RunOpts{Prompt: "resolve the conflict"})
 	if !errors.Is(err, routing.ErrNoAllowedProfile) {
 		t.Fatalf("error %v must be ErrNoAllowedProfile", err)
@@ -1127,7 +1159,7 @@ func TestRunAgent_FinishLostInTransitIsRetriedByTheReleaseBackstop(t *testing.T)
 	run := testRouting(t, transport, []routing.Profile{routingPiGrokProfile()},
 		func(p routing.Profile) (agent.Agent, error) { return &recordingAgent{profile: p}, nil })
 
-	sctx := &StepContext{Ctx: context.Background(), Agent: &hangingAgent{name: "configured"}, Routing: run}
+	sctx := &StepContext{Ctx: context.Background(), Agent: &hangingAgent{name: "configured"}, Routing: run, WrapAgent: testStepHarness}
 	if _, err := sctx.RunAgent(agent.RunOpts{Prompt: "repair", Purpose: "review-fix"}); err != nil {
 		t.Fatalf("a lost finish must not fail the turn, which already happened: %v", err)
 	}
@@ -1175,7 +1207,7 @@ func TestRunAgent_LostFinishForAFailedTurnRetriesTheSameFailure(t *testing.T) {
 			}}, nil
 		})
 
-	sctx := &StepContext{Ctx: context.Background(), Agent: &hangingAgent{name: "configured"}, Routing: run}
+	sctx := &StepContext{Ctx: context.Background(), Agent: &hangingAgent{name: "configured"}, Routing: run, WrapAgent: testStepHarness}
 	if _, err := sctx.RunAgent(agent.RunOpts{Prompt: "repair", Purpose: "review-fix"}); err == nil {
 		t.Fatal("a failed turn must still fail the caller")
 	}
@@ -1201,7 +1233,7 @@ func TestRelease_WithNoRecordedOutcomeReportsLaunchFailed(t *testing.T) {
 	run := testRouting(t, transport, []routing.Profile{routingPiGrokProfile()},
 		func(p routing.Profile) (agent.Agent, error) { return &recordingAgent{profile: p}, nil })
 
-	sctx := &StepContext{Ctx: context.Background(), Agent: &hangingAgent{name: "configured"}, Routing: run}
+	sctx := &StepContext{Ctx: context.Background(), Agent: &hangingAgent{name: "configured"}, Routing: run, WrapAgent: testStepHarness}
 	opts := agent.RunOpts{Prompt: "repair", Purpose: "review-fix"}
 	var ag agent.Agent = sctx.Agent
 	invocation, routed, release, err := sctx.acquireRoute(context.Background(), &opts, &ag)
@@ -1237,7 +1269,7 @@ func TestRunAgent_DeliveredFinishIsNotReportedTwice(t *testing.T) {
 	run := testRouting(t, transport, []routing.Profile{routingPiGrokProfile()},
 		func(p routing.Profile) (agent.Agent, error) { return &recordingAgent{profile: p}, nil })
 
-	sctx := &StepContext{Ctx: context.Background(), Agent: &hangingAgent{name: "configured"}, Routing: run}
+	sctx := &StepContext{Ctx: context.Background(), Agent: &hangingAgent{name: "configured"}, Routing: run, WrapAgent: testStepHarness}
 	if _, err := sctx.RunAgent(agent.RunOpts{Prompt: "repair", Purpose: "review-fix"}); err != nil {
 		t.Fatalf("run: %v", err)
 	}
