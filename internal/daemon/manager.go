@@ -26,6 +26,7 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/pipeline"
 	"github.com/kunchenguid/no-mistakes/internal/pipeline/steps"
 	"github.com/kunchenguid/no-mistakes/internal/procreap"
+	"github.com/kunchenguid/no-mistakes/internal/routing"
 	"github.com/kunchenguid/no-mistakes/internal/runenv"
 	"github.com/kunchenguid/no-mistakes/internal/safeurl"
 	"github.com/kunchenguid/no-mistakes/internal/telemetry"
@@ -51,6 +52,10 @@ type RunManager struct {
 	db           *db.DB
 	paths        *paths.Paths
 	steps        StepFactory
+	// routingGeneration names this daemon incarnation to the assignment hook.
+	// It is fixed at construction so every run of this process, including a
+	// run resumed after crash recovery, reports the same generation.
+	routingGeneration string
 
 	branchLocks sync.Map // repoID+"/"+branch → *sync.Mutex
 
@@ -93,6 +98,8 @@ func NewRunManager(database *db.DB, p *paths.Paths, stepFactory StepFactory) *Ru
 		subscribers:   make(map[string][]*eventMailbox),
 		stateRevs:     make(map[string]int64),
 		completedRuns: make(map[string]bool),
+
+		routingGeneration: routingGeneration(os.Getpid(), time.Now()),
 	}
 }
 
@@ -178,7 +185,8 @@ func (m *RunManager) prepareRecoveredRun(ctx context.Context, run *db.Run) (*rec
 		return nil, err
 	}
 	if cfg.SessionReuse {
-		if err := validateRecoveredSessionProviders(m.db, run.ID, ag); err != nil {
+		routedAgent := m.newRoutedAgentFactory(cfg, m.paths.EvidenceRoot(cfg.Test.Evidence.LocalRoot), forgeEnvironment(forgeCtx))
+		if err := validateRecoveredSessionProviders(m.db, run.ID, ag, cfg.Assignment.Profiles, routedAgent); err != nil {
 			_ = ag.Close()
 			return nil, err
 		}
@@ -195,7 +203,21 @@ func (m *RunManager) prepareRecoveredRun(ctx context.Context, run *db.Run) (*rec
 	}, nil
 }
 
-func validateRecoveredSessionProviders(database *db.DB, runID string, ag agent.Agent) error {
+// validateRecoveredSessionProviders refuses a recovered run whose persisted
+// fixer session names a provider nothing configured could resume.
+//
+// The authority is every adapter the run could actually launch, not the run's
+// default agent alone. Under routing a fixer session is minted by whichever
+// approved profile served that turn, so a codex-minted session on a
+// claude-default run is still perfectly resumable and must not strand the run.
+// That is the same rule NewRunSessions and RunSessions.remember already apply:
+// the adapter that ran, never the default one, owns a routed identity.
+//
+// It stays a real gate. A provider no configured profile and no default agent
+// recognizes is still refused, and a keyed row whose profile merely changed is
+// caught later by resumableUnderProfile, which yields an empty SessionRef
+// rather than failing the run.
+func validateRecoveredSessionProviders(database *db.DB, runID string, ag agent.Agent, profiles []routing.Profile, newRoutedAgent func(routing.Profile) (agent.Agent, error)) error {
 	sessions, err := database.GetRunAgentSessions(runID)
 	if err != nil {
 		return fmt.Errorf("get run sessions: %w", err)
@@ -207,11 +229,43 @@ func validateRecoveredSessionProviders(database *db.DB, runID string, ag agent.A
 		if session.Agent == "" || session.SessionID == "" {
 			return fmt.Errorf("recovered run has incomplete session metadata")
 		}
-		if session.Role == string(pipeline.SessionRoleFixer) && !agent.SupportsSessionProvider(ag, session.Agent) {
-			return fmt.Errorf("session provider %q is no longer configured", session.Agent)
+		if session.Role != string(pipeline.SessionRoleFixer) {
+			continue
 		}
+		if agent.SupportsSessionProvider(ag, session.Agent) {
+			continue
+		}
+		if routedProfileSupportsProvider(profiles, newRoutedAgent, session.Agent) {
+			continue
+		}
+		return fmt.Errorf("session provider %q is no longer configured", session.Agent)
 	}
 	return nil
+}
+
+// routedProfileSupportsProvider reports whether any approved routing profile
+// builds an adapter that could resume a session minted by provider.
+//
+// It asks the adapters themselves rather than comparing names, so an adapter
+// that accepts more than one spelling of its provider keeps working here for
+// the same reason it works everywhere else. Each probe adapter is closed
+// immediately: this only constructs one to ask a question, never to launch it.
+func routedProfileSupportsProvider(profiles []routing.Profile, newRoutedAgent func(routing.Profile) (agent.Agent, error), provider string) bool {
+	if newRoutedAgent == nil || provider == "" {
+		return false
+	}
+	for _, profile := range profiles {
+		built, err := newRoutedAgent(profile)
+		if err != nil || built == nil {
+			continue
+		}
+		supported := agent.SupportsSessionProvider(built, provider)
+		_ = built.Close()
+		if supported {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *RunManager) loadRecoveredConfig(ctx context.Context, run *db.Run, repo *db.Repo, workDir string) (*config.Config, error) {
@@ -388,6 +442,9 @@ func (m *RunManager) resumeRecoveredRun(plan recoveredRunPlan) {
 	}
 	runCtx, cancel := context.WithCancelCause(context.Background())
 	executor := pipeline.NewExecutor(m.db, m.paths, plan.cfg, plan.agent, plan.steps, m.broadcast)
+	executor.SetRouting(
+		m.newRoutedAgentFactory(plan.cfg, m.paths.EvidenceRoot(plan.cfg.Test.Evidence.LocalRoot), forgeEnvironment(plan.forge)),
+		routingOwner(), m.routingGeneration)
 	executor.SetOnPRMerged(func(_ context.Context, runID string) {
 		m.wg.Add(1)
 		go func() {
@@ -1428,6 +1485,9 @@ func (m *RunManager) startRunWithIntentSourceLocked(ctx context.Context, repo *d
 	// Create executor with event broadcast.
 	runCtx, cancel := context.WithCancelCause(context.Background())
 	executor := pipeline.NewExecutor(m.db, m.paths, cfg, ag, execSteps, m.broadcast)
+	executor.SetRouting(
+		m.newRoutedAgentFactory(cfg, m.paths.EvidenceRoot(cfg.Test.Evidence.LocalRoot), forgeEnvironment(forgeCtx)),
+		routingOwner(), m.routingGeneration)
 	executor.SetForgeContext(forgeCtx)
 	executor.SetSkippedSteps(skipSteps)
 	executor.SetOnPRMerged(func(_ context.Context, runID string) {

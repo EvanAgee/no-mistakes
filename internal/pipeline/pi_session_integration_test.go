@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/kunchenguid/no-mistakes/internal/agent"
+	"github.com/kunchenguid/no-mistakes/internal/routing"
 )
 
 // writeFakePiExecutable materializes a fake `pi` binary for the pipeline
@@ -137,7 +138,7 @@ printf '%s\n' '{"type":"agent_end","messages":[{"role":"assistant","content":[{"
 		return s.SessionID
 	}
 
-	first, err := rs.Run(context.Background(), pa, SessionRoleFixer, opts, nil)
+	first, err := rs.Run(context.Background(), fixedLauncher(pa, routing.UnroutedProfileKey), SessionRoleFixer, opts, nil)
 	if err != nil {
 		t.Fatalf("first fixer turn: %v", err)
 	}
@@ -156,7 +157,7 @@ printf '%s\n' '{"type":"agent_end","messages":[{"role":"assistant","content":[{"
 	if err := os.WriteFile(expire, []byte("x"), 0o644); err != nil {
 		t.Fatalf("write expire marker: %v", err)
 	}
-	second, err := rs.Run(context.Background(), pa, SessionRoleFixer, opts, nil)
+	second, err := rs.Run(context.Background(), fixedLauncher(pa, routing.UnroutedProfileKey), SessionRoleFixer, opts, nil)
 	if err != nil {
 		t.Fatalf("fixer turn after dead resume must fall back, got error: %v", err)
 	}
@@ -183,7 +184,7 @@ printf '%s\n' '{"type":"agent_end","messages":[{"role":"assistant","content":[{"
 	if err := os.Remove(expire); err != nil {
 		t.Fatalf("remove expire marker: %v", err)
 	}
-	third, err := rs.Run(context.Background(), pa, SessionRoleFixer, opts, nil)
+	third, err := rs.Run(context.Background(), fixedLauncher(pa, routing.UnroutedProfileKey), SessionRoleFixer, opts, nil)
 	if err != nil {
 		t.Fatalf("third fixer turn: %v", err)
 	}

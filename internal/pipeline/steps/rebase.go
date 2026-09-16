@@ -474,6 +474,7 @@ Instructions:
 		CWD:        sctx.WorkDir,
 		JSONSchema: commitSummarySchema,
 		OnChunk:    sctx.LogChunk,
+		Purpose:    "rebase-conflict",
 	})
 	if err != nil {
 		_, _ = git.Run(ctx, sctx.WorkDir, "rebase", "--abort")
@@ -616,6 +617,7 @@ Instructions:
 		CWD:        sctx.WorkDir,
 		JSONSchema: commitSummarySchema,
 		OnChunk:    sctx.LogChunk,
+		Purpose:    "rebase-conflict",
 	})
 	if err != nil {
 		_, _ = git.Run(ctx, sctx.WorkDir, "merge", "--abort")

@@ -576,7 +576,137 @@ The fixer session is never lent to review turns, other pipeline steps stay sessi
 When resume is unavailable or fails, the fix turn falls back to a cold run or a fresh fixer session and the fallback is recorded in the local `agent_invocations` performance record. Pi emits per-invocation usage after a resume, unlike Codex's cumulative session counters.
 Session identities are persisted only as minimum local resume metadata, never as prompts or transcripts; Pi's own session directory retains its native transcript. Keep Pi's session directory private, and keep any `--session-dir` or `PI_CODING_AGENT_SESSION_DIR` setting stable while a run is active so a daemon restart can find the fixer session.
 The [daemon crash-recovery reference](/no-mistakes/concepts/daemon/#crash-recovery) owns which parked gates can resume or reconcile after a restart.
+Under [`assignment`](#assignment) the adapter that resumes is the one the hook selected for that turn, not the agent you configured, so a run configured with a non-resuming agent still reuses sessions on turns routed to a resuming one; that section owns how a profile's identity qualifies reuse.
 Set `false` to force every agent invocation cold.
+
+### assignment
+
+Continuous routing: which approved native execution profile serves each agent invocation.
+
+|         |          |
+| ------- | -------- |
+| Type    | `object` |
+| Default | unset    |
+
+Unset means routing is off, and every invocation launches the configured agent exactly as it did before this setting existed.
+
+Routing exists for one job: spreading a run's work across several subscriptions you already pay for, without asking anything each time.
+Instead of one agent serving every turn, each invocation asks an external hook which approved service should serve it next.
+A process already running is never touched; the choice applies to the next invocation.
+
+Global-only, like `agent_config`: it decides which process runs with this machine's credentials against which subscription, so a pushed branch must never influence it.
+
+```yaml
+assignment:
+  hook_path: /opt/firstmate/bin/fm-route.sh
+  hook_timeout: 30s
+  profiles:
+    - id: claude-opus
+      agent: claude
+      provider: anthropic-subscription
+      model: opus
+      effort: xhigh
+    - id: codex-sol
+      agent: codex
+      provider: openai-subscription
+      model: gpt-5.6-sol
+      effort: high
+    - id: pi-grok
+      agent: pi
+      provider: xai-subscription
+      model: xai/grok-4.6
+      effort: xhigh
+    - id: pi-deepseek
+      agent: pi
+      provider: vercel-ai-gateway
+      model: vercel-ai-gateway/deepseek/deepseek-v4.1-flash
+      effort: xhigh
+      roles: ["review-fix"]
+```
+
+`hook_path` names the executable, and `hook_args` any fixed arguments it needs before the verb (most hooks need none).
+no-mistakes appends the verb (`acquire` or `finish`) as the final argument and writes one JSON request to standard input.
+It is run directly, never through a shell, so no part of the request can be read as a command.
+
+The request carries the assignment id, this daemon's owner identity and generation, and the ids the hook may choose among:
+
+```json
+{
+  "assignment_id": "01JC...-4242-1757951000000000000-launch-3",
+  "owner": {"identity": "no-mistakes-daemon", "generation": "4242-1757951000000000000"},
+  "routes": ["claude-opus", "codex-sol", "pi-grok"]
+}
+```
+
+The hook answers with one JSON object. Only `"result": "selected"` authorizes a launch:
+
+```json
+{"result": "selected", "route_id": "codex-sol", "reason": "fewest-pending", "generation": 5}
+{"result": "deferred", "reason": "every candidate route is excluded", "generation": 5}
+{"result": "already-closed", "reason": "already closed; not relaunched"}
+{"result": "error", "error": "unknown route id: bogus"}
+```
+
+A hook can only pick from the ids you listed here.
+It cannot name a command, a path, a model, or a route you did not approve.
+Anything else - an unknown id, unreadable or oversized output, a reply that is not `selected`, a nonzero exit, a timeout - stops that invocation with an error and launches nothing.
+It never quietly falls back to your default agent, because that is exactly how an excluded service would end up running anyway.
+
+A deferral is not a failure and is not remembered.
+It means no approved service is admissible right now, and the same work can be retried once the hook's evidence refreshes.
+
+`already-closed` means that exact launch already ran.
+It carries no route on purpose, so it can never authorize a second run of work the hook has already counted.
+Every launch gets its own assignment id, so a retry or a recovered turn is a new launch rather than a replay of a spent one.
+The unit is a launch, not a pipeline turn: one turn can be two launches when a stored session fails to resume and the same prompt is re-run in a fresh session, and each of those processes acquires and reports separately.
+The id carries the daemon incarnation as well as the run, because the hook recognises a repeat id by (id, owner identity) and ignores the generation there: without it, a run resumed after a daemon restart would re-acquire the ids the previous incarnation already closed.
+
+When a launch ends, no-mistakes calls `finish` with its assignment id, the outcome, and the profile that actually ran.
+A completed launch reports `success`; anything else reports `launch-failed`, which releases the assignment without claiming the service is broken.
+The hook's other outcomes (`auth-failed`, `exhausted`, `outage`) take a route out of the pool for every caller on the machine, so no-mistakes never reports one on a guess about why a turn failed.
+
+`hook_timeout` bounds one hook call (default 30s).
+
+Each profile needs an `id` unique to this file, an `agent`, and a `provider`.
+`agent` must be `claude`, `codex`, or `pi`; those are the adapters whose session, structured-output, and project-instruction behavior no-mistakes verifies natively.
+`pi` covers both Grok and Gateway-served models, which is why those are two profiles rather than two adapters.
+`provider` is your own stable label for the billing route, such as `anthropic-subscription` or `vercel-ai-gateway`.
+It is never a credential and never the account a proxy currently has selected: keep it unchanged across token and account rotation, or every rotation throws away a reusable session.
+`model` and `effort` are the same harness-neutral knobs as [`agent_config`](#agent_config), validated against what that harness can express.
+`model` is optional, but leaving it out costs session reuse: a profile with no explicit model never resumes a session and always starts a fresh one, because two profiles naming the same adapter cannot then be proven to serve the same model. no-mistakes logs one warning per such profile at config load. Set `model` on a profile whose turns should reuse their session.
+`roles`, when set, restricts the profile to those pipeline duties; omit it to allow every role.
+
+The complete role vocabulary is:
+
+| Role | The invocation it serves |
+| --- | --- |
+| `review` | the review analysis turn |
+| `review-fix` | the review fixer turn |
+| `test-evidence` | the Test step's live-validation turn |
+| `document` | the documentation pass |
+| `housekeeping` | the combined document-plus-lint pass, used when `commands.lint` is empty |
+| `lint` | the lint pass |
+| `rebase-conflict` | a rebase or merge conflict resolver |
+| `pr` | PR body drafting |
+| `pr-title` | PR title drafting, when a title pattern is configured |
+| `pr-template` | PR narrative drafting under a repository `pr.template` |
+| `ci-fix` | the CI repair turn |
+| `intent-summarize` | the intent step's transcript summarizer |
+| `intent-disambiguate` | the intent step's candidate reranker |
+| `<step>-fix` | a step's own fixer turn, for example `test-fix` or `lint-fix`; repository gates use `gate.<anchor>.<label>-fix` |
+
+A role no profile accepts fails that invocation with a configuration error naming the role, rather than falling back to your default agent.
+Leave at least one profile unrestricted unless you intend to enumerate every role above.
+
+Routing supersedes [`review_agents`](#review_agents) for every turn it serves.
+`review_agents` picks the reviewer and the fixer by the adapter you configured for each duty, but a routed turn runs whichever approved profile the hook selected, so that split no longer applies and one service can both prescribe and certify the same fixes.
+If you enable assignment and want the reviewer and the fixer kept independent, express that split again through per-profile `roles`: give the reviewing profiles `roles: [review]` and the fixing profiles the fix roles, so no profile is admissible for both.
+
+Session reuse follows the profile, not the adapter name.
+Consecutive turns on the same profile resume the same native session, provided that profile sets an explicit `model`; a turn on a different profile always starts a fresh one, because a session id belongs to the exact service that minted it.
+Two `pi` profiles are a different service in this sense even though they share a binary.
+A profile with no `model` has no identity to match, so every turn it serves starts fresh no matter how many run consecutively.
+Runs parked by an earlier version keep working: their sessions have no recorded profile, so they resume normally while routing is off and start fresh once routing is on.
 
 ### worktree_roots
 

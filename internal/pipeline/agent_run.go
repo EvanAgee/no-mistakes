@@ -62,16 +62,116 @@ func (sctx *StepContext) runAgent(parent context.Context, opts agent.RunOpts, se
 		ag = sctx.Agent
 		timeout = AgentTimeout(sctx.Config)
 	}
+
+	// Routing wraps each adapter attempt, not the deadline: a route is
+	// acquired before a process starts and released after it ends, whatever
+	// ends it. This is the single seam every step's agent invocation passes
+	// through - review, fix, test, document, lint, rebase, pr, ci, and intent
+	// through SeamAgent - so placing acquire/finish here is what makes "every
+	// native invocation is routed" true by construction rather than by each
+	// step remembering to ask.
+	launch := sctx.agentLauncher(ag)
+
 	activity := observeAgentActivity(&opts)
 	return invokeAgent(parent, timeout, activity, func(ctx context.Context) (*agent.Result, error) {
 		if sessionRole != "" && sctx != nil && sctx.Sessions != nil {
-			return sctx.Sessions.Run(ctx, ag, sessionRole, opts, sctx.Log)
+			return sctx.Sessions.Run(ctx, launch, sessionRole, opts, sctx.Log)
 		}
-		if ag == nil {
-			return nil, errors.New("nil agent")
-		}
-		return ag.Run(ctx, opts)
+		_, result, err := launch.Run(ctx, opts, nil)
+		return result, err
 	})
+}
+
+// agentLauncher exposes this invocation's adapter as something that can be
+// launched repeatedly, once per concrete attempt.
+//
+// One turn is not always one process. A durable-session turn whose resume
+// fails re-runs the same prompt in a fresh session, which is a SECOND real
+// adapter launch consuming a second turn of the route's quota. The routing
+// contract is per launch, not per turn: the controller treats a repeated
+// assignment id as the same launch, so both attempts sharing one assignment
+// would be billed as one. Handing the caller a launcher rather than an adapter
+// is what makes each attempt acquire its own assignment and report its own
+// outcome.
+func (sctx *StepContext) agentLauncher(configured agent.Agent) agentLauncher {
+	return &routedLauncher{sctx: sctx, configured: configured}
+}
+
+// agentLauncher is what a caller that may need more than one attempt per turn
+// holds instead of an adapter.
+//
+// Run performs exactly one attempt and answers with the adapter that actually
+// served it, so a stored session identity is attributed to whatever really
+// ran rather than to whatever was configured.
+type agentLauncher interface {
+	// Name answers for the step's configured agent, which is what runs when
+	// routing is off and what an operator reading a log line about this turn
+	// is asking about.
+	//
+	// There is deliberately no SupportsSessionResume here. Whether the
+	// adapter that serves an attempt can resume a session is only knowable
+	// once that attempt's route is acquired, and under routing the configured
+	// agent is not it: a run configured with a non-resuming adapter can be
+	// routed to a resuming one and vice versa. Asking the launcher would
+	// answer for the wrong process, so the question belongs inside prepare,
+	// which runs with the real adapter in hand.
+	Name() string
+	// Run performs one attempt. prepare (optional) receives the adapter about
+	// to launch and its profile key, and may adjust the options - that is
+	// where a session reference is chosen, because which profile serves this
+	// attempt is what decides both whether that adapter can resume at all and
+	// whether a stored session may be resumed by it.
+	Run(ctx context.Context, opts agent.RunOpts, prepare func(agent.Agent, string, *agent.RunOpts)) (agent.Agent, *agent.Result, error)
+}
+
+// routedLauncher performs one concrete adapter attempt: acquire a route, run
+// the adapter the decision names, report the outcome, release. With routing
+// off it is a direct call on the step's configured agent, byte-for-byte the
+// pre-routing behavior.
+type routedLauncher struct {
+	sctx       *StepContext
+	configured agent.Agent
+}
+
+func (l *routedLauncher) Name() string {
+	if l == nil || l.configured == nil {
+		return ""
+	}
+	return l.configured.Name()
+}
+
+// Run performs exactly one attempt under exactly one assignment.
+//
+// The route is acquired BEFORE prepare runs, because which profile serves this
+// attempt is what decides whether a stored session may be resumed at all, and
+// that decision has to be made against the adapter actually about to launch.
+// prepare receives that adapter and its profile key, may adjust the options
+// (that is where the session reference is chosen), and the same adapter is
+// then reported to the caller so a stored identity is attributed to whatever
+// really ran.
+func (l *routedLauncher) Run(ctx context.Context, opts agent.RunOpts, prepare func(agent.Agent, string, *agent.RunOpts)) (agent.Agent, *agent.Result, error) {
+	if l == nil {
+		return nil, nil, errors.New("nil agent launcher")
+	}
+	ag := l.configured
+	assignment, routed, release, err := l.sctx.acquireRoute(ctx, &opts, &ag)
+	if err != nil {
+		return nil, nil, err
+	}
+	if routed {
+		defer release()
+	}
+	if ag == nil {
+		return nil, nil, errors.New("nil agent")
+	}
+	if prepare != nil {
+		prepare(ag, assignment.ProfileKey(), &opts)
+	}
+	result, err := ag.Run(ctx, opts)
+	if routed {
+		l.sctx.recordRouteOutcome(assignment, err)
+	}
+	return ag, result, err
 }
 
 func invokeAgent(parent context.Context, timeout time.Duration, activity *agentActivity, run func(context.Context) (*agent.Result, error)) (*agent.Result, error) {
@@ -370,4 +470,77 @@ func (a *timeoutAgent) ReportsAgentAttempts() bool {
 
 func (a *timeoutAgent) NeutralizesGateInstructions() bool {
 	return agent.NeutralizesGateInstructions(a.inner)
+}
+
+// SeamAgent presents this step context's invocation seam as an agent.Agent.
+//
+// It exists for the two collaborators that take an adapter rather than call
+// the step context directly: the intent summarizer and disambiguator, which
+// internal/intent constructs from an agent.Agent. Handing those the raw
+// sctx.Agent made them the only native invocations in the pipeline that never
+// acquired a route, so they were silently excluded from balancing while the
+// seam's own comment claimed every invocation passed through it.
+//
+// Every call is a full seam invocation: acquire, the invocation deadline,
+// routing's adapter substitution, and finish. Name and the capability
+// predicates answer for the step's configured agent, because that is what runs
+// when routing is off and what a caller inspecting the adapter is asking
+// about; a routed turn substitutes its own adapter inside Run, after the
+// capability question has already been answered for the turn's prompt.
+func (sctx *StepContext) SeamAgent(purpose string) agent.Agent {
+	return &seamAgent{sctx: sctx, purpose: purpose}
+}
+
+type seamAgent struct {
+	sctx    *StepContext
+	purpose string
+}
+
+func (a *seamAgent) Name() string {
+	if a.sctx == nil || a.sctx.Agent == nil {
+		return ""
+	}
+	return a.sctx.Agent.Name()
+}
+
+// Close is a no-op: the step's agent outlives this view of it and is the
+// executor's to close, and a routed adapter is closed by routing's own release.
+func (a *seamAgent) Close() error { return nil }
+
+func (a *seamAgent) Run(ctx context.Context, opts agent.RunOpts) (*agent.Result, error) {
+	if a.sctx == nil {
+		return nil, errors.New("nil step context")
+	}
+	if opts.Purpose == "" {
+		opts.Purpose = a.purpose
+	}
+	return a.sctx.runAgent(ctx, opts, "")
+}
+
+func (a *seamAgent) SupportsSessionResume() bool {
+	if a.sctx == nil {
+		return false
+	}
+	return agent.SupportsSessionResume(a.sctx.Agent)
+}
+
+func (a *seamAgent) SupportsSessionProvider(provider string) bool {
+	if a.sctx == nil {
+		return false
+	}
+	return agent.SupportsSessionProvider(a.sctx.Agent, provider)
+}
+
+func (a *seamAgent) ReportsAgentAttempts() bool {
+	if a.sctx == nil {
+		return false
+	}
+	return agent.ReportsAgentAttempts(a.sctx.Agent)
+}
+
+func (a *seamAgent) NeutralizesGateInstructions() bool {
+	if a.sctx == nil {
+		return false
+	}
+	return agent.NeutralizesGateInstructions(a.sctx.Agent)
 }
