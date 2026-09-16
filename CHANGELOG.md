@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.77.0](https://github.com/kunchenguid/no-mistakes/compare/v1.76.0...v1.77.0) (2026-09-16)
+
+
+### Features
+
+* **pipeline:** integrate a moved base by merging behind rebase.strategy ([#1081](https://github.com/kunchenguid/no-mistakes/issues/1081)) ([ae2e99a](https://github.com/kunchenguid/no-mistakes/commit/ae2e99a8b250eb90e66211ae98508f1b21442293))
+
 ## [1.76.0](https://github.com/kunchenguid/no-mistakes/compare/v1.75.3...v1.76.0) (2026-09-15)
 
 
