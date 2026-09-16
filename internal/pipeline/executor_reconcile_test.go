@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -526,11 +527,7 @@ func TestExecutor_RecoveredGateReconciliationWrapsARoutedAdapter(t *testing.T) {
 	}
 
 	profile := routingPiGrokProfile()
-	hookPath := filepath.Join(t.TempDir(), "assignment-hook")
-	script := "#!/bin/sh\ncat >/dev/null\nif [ \"$1\" = finish ]; then\n  printf '{\"result\":\"closed\"}'\nelse\n  printf '{\"result\":\"selected\",\"route_id\":\"%s\",\"reason\":\"test\"}' " + profile.ID + "\nfi\n"
-	if err := os.WriteFile(hookPath, []byte(script), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	hookPath := writeSelectingAssignmentHook(t, t.TempDir(), profile.ID)
 
 	cfg := &config.Config{Assignment: config.Assignment{
 		HookPath: hookPath,
@@ -561,4 +558,41 @@ func TestExecutor_RecoveredGateReconciliationWrapsARoutedAdapter(t *testing.T) {
 	if !strings.Contains(prompts[0], "is this gate still real") {
 		t.Fatalf("the routed adapter lost the reconciler's own prompt; prompt was:\n%s", prompts[0])
 	}
+}
+
+// writeSelectingAssignmentHook writes an executable assignment hook that
+// selects routeID on acquire and reports closed on finish.
+//
+// internal/routing.Hook launches the configured path directly with
+// exec.CommandContext and no shell, so a bare POSIX script with a shebang and
+// no extension cannot run on Windows: CreateProcess needs a recognized
+// executable extension and ignores the shebang entirely. The repository's
+// established fixture pattern is to branch on the platform and emit a .bat
+// there, which is what this does.
+func writeSelectingAssignmentHook(t *testing.T, dir, routeID string) string {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		path := filepath.Join(dir, "assignment-hook.bat")
+		// goto labels rather than parenthesized if/else blocks: cmd parses a
+		// block as one command line, so the ")" and quoting in the JSON body
+		// are a needless hazard there. The request body on stdin is simply
+		// left unread, which the caller closes either way.
+		script := "@echo off\r\n" +
+			"if \"%~1\"==\"finish\" goto finish\r\n" +
+			"echo {\"result\":\"selected\",\"route_id\":\"" + routeID + "\",\"reason\":\"test\"}\r\n" +
+			"exit /b 0\r\n" +
+			":finish\r\n" +
+			"echo {\"result\":\"closed\"}\r\n" +
+			"exit /b 0\r\n"
+		if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	path := filepath.Join(dir, "assignment-hook")
+	script := "#!/bin/sh\ncat >/dev/null\nif [ \"$1\" = finish ]; then\n  printf '{\"result\":\"closed\"}'\nelse\n  printf '{\"result\":\"selected\",\"route_id\":\"%s\",\"reason\":\"test\"}' " + routeID + "\nfi\n"
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return path
 }

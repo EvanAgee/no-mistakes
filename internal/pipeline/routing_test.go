@@ -83,7 +83,14 @@ func testRoutingForGeneration(t *testing.T, transport *fakeHookTransport, profil
 	newAgent func(routing.Profile) (agent.Agent, error), generation string) *RunRouting {
 	t.Helper()
 
-	hook := routing.NewTestHook(func(_ context.Context, verb routing.Verb, stdin []byte) ([]byte, error) {
+	hook := routing.NewTestHook(func(ctx context.Context, verb routing.Verb, stdin []byte) ([]byte, error) {
+		// The real hook is a subprocess launched with exec.CommandContext, so a
+		// dead context fails the call before the controller ever sees it. Model
+		// that here, or a test about reporting through a cancelled context
+		// proves nothing.
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		var req routing.Request
 		if err := json.Unmarshal(stdin, &req); err != nil {
 			t.Fatalf("unreadable request: %v", err)
@@ -1280,5 +1287,61 @@ func TestRunAgent_DeliveredFinishIsNotReportedTwice(t *testing.T) {
 	}
 	if finishes[0].Outcome != routing.OutcomeSuccess {
 		t.Fatalf("outcome = %q, want success", finishes[0].Outcome)
+	}
+}
+
+// TestAcquireRoute_CancelledCallerStillReportsTheFailedLaunch proves the
+// build-failure path's report survives caller cancellation.
+//
+// That report is the ONLY one this assignment will ever get: acquire returns
+// an error, so the caller never installs its deferred release backstop. Riding
+// the caller's context meant a cancellation arriving between Route selecting a
+// profile and the adapter build failing rejected the single report and left
+// the controller counting the assignment as running forever.
+func TestAcquireRoute_CancelledCallerStillReportsTheFailedLaunch(t *testing.T) {
+	profile := routingPiGrokProfile()
+	ctx, cancel := context.WithCancel(context.Background())
+
+	transport := &fakeHookTransport{
+		reply: func(verb routing.Verb, req routing.Request) routing.Response {
+			if verb == routing.VerbFinish {
+				return routing.Response{Result: "closed", AssignmentID: req.AssignmentID}
+			}
+			// The caller is cancelled the instant a profile is selected, which
+			// is the window this fix exists for.
+			cancel()
+			return routing.Response{Result: "selected", RouteID: profile.ID, Reason: "fewest-pending"}
+		},
+	}
+	routed := testRouting(t, transport, []routing.Profile{profile},
+		func(routing.Profile) (agent.Agent, error) {
+			return nil, errors.New("the adapter factory refused this profile")
+		})
+
+	sctx := &StepContext{
+		Ctx:       ctx,
+		Agent:     &hangingAgent{name: "configured"},
+		Routing:   routed,
+		WrapAgent: testStepHarness,
+	}
+
+	var ag agent.Agent = sctx.Agent
+	opts := agent.RunOpts{Prompt: "fix this", Purpose: "review-fix"}
+	_, selected, _, err := sctx.acquireRoute(ctx, &opts, &ag)
+	if err == nil {
+		t.Fatal("a failed adapter build must refuse the launch")
+	}
+	if selected {
+		t.Fatal("a failed adapter build must launch nothing")
+	}
+
+	finishes := transport.finishes()
+	if len(finishes) != 1 {
+		t.Fatalf("finishes = %d, want exactly 1; a cancelled caller must not swallow the only report",
+			len(finishes))
+	}
+	if finishes[0].Outcome != routing.OutcomeLaunchFailed {
+		t.Fatalf("outcome = %q, want launch-failed; the process never started",
+			finishes[0].Outcome)
 	}
 }

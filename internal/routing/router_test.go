@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // recordingHook captures every request a router makes and replies from a
@@ -600,4 +601,168 @@ func TestRouter_AssignmentCarriesItsProfileKey(t *testing.T) {
 
 func assignmentID(i int) string {
 	return fmt.Sprintf("run-1-launch-%d", i)
+}
+
+// TestRouter_ConcurrentRoutesForOneIDAcquireOnce proves the router's
+// single-use guard holds against any caller, not only one that happens to mint
+// distinct ids.
+//
+// Checking membership under the lock and recording the id only after the hook
+// answers leaves an unguarded window: both callers pass the check, both send
+// an acquire for the same (assignment_id, owner.identity) the controller
+// treats as ONE launch, and the second overwrites the first's profile - so the
+// finish that follows reports an identity that never ran, and the other launch
+// can never be reported at all.
+func TestRouter_ConcurrentRoutesForOneIDAcquireOnce(t *testing.T) {
+	// Hold both callers inside the hook so the window, if any, is wide open.
+	entered := make(chan struct{}, 2)
+	proceed := make(chan struct{})
+	rh := &recordingHook{
+		reply: func(verb Verb, req Request) Response {
+			if verb == VerbFinish {
+				return Response{Result: resultClosed}
+			}
+			entered <- struct{}{}
+			<-proceed
+			return Response{Result: resultSelected, RouteID: "pi-grok"}
+		},
+	}
+	router := testRouter(t, rh, piGrokProfile(), piDeepSeekProfile())
+
+	const id = "run-1-gen-1-launch-1"
+	type outcome struct {
+		selected bool
+		err      error
+	}
+	results := make(chan outcome, 2)
+	for range 2 {
+		go func() {
+			_, selected, err := router.Route(context.Background(), id, "review-fix")
+			results <- outcome{selected: selected, err: err}
+		}()
+	}
+
+	// Exactly one caller may reach the hook. Give the loser a real chance to
+	// arrive before concluding it was refused.
+	select {
+	case <-entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("no caller reached the hook")
+	}
+	select {
+	case <-entered:
+		t.Fatal("both concurrent callers reached the hook; one assignment id sent two acquires")
+	case <-time.After(200 * time.Millisecond):
+	}
+	close(proceed)
+
+	var admitted, refused int
+	for range 2 {
+		got := <-results
+		switch {
+		case got.err == nil && got.selected:
+			admitted++
+		case got.err != nil:
+			refused++
+		default:
+			t.Fatalf("unexpected outcome %+v", got)
+		}
+	}
+	if admitted != 1 || refused != 1 {
+		t.Fatalf("admitted=%d refused=%d, want exactly one of each", admitted, refused)
+	}
+
+	acquires := 0
+	rh.mu.Lock()
+	for _, seen := range rh.requests {
+		if seen.verb == VerbAcquire {
+			acquires++
+		}
+	}
+	rh.mu.Unlock()
+	if acquires != 1 {
+		t.Fatalf("hook saw %d acquires for one assignment id, want 1", acquires)
+	}
+
+	// The single admitted launch is still reportable, and its identity is the
+	// one that was acquired.
+	if err := router.Finish(context.Background(), id, OutcomeSuccess); err != nil {
+		t.Fatalf("finish the admitted launch: %v", err)
+	}
+}
+
+// TestRouter_FailedAcquireLeavesTheIDRetriable proves the reservation is
+// removed when the hook admits nothing, so a deferral stays retriable and a
+// corrected retry is a fresh acquire rather than a local replay.
+func TestRouter_FailedAcquireLeavesTheIDRetriable(t *testing.T) {
+	var deferFirst = true
+	rh := &recordingHook{
+		reply: func(verb Verb, req Request) Response {
+			if verb == VerbFinish {
+				return Response{Result: resultClosed}
+			}
+			if deferFirst {
+				deferFirst = false
+				return Response{Result: resultDeferred, Reason: "no capacity right now"}
+			}
+			return Response{Result: resultSelected, RouteID: "pi-grok"}
+		},
+	}
+	router := testRouter(t, rh, piGrokProfile())
+
+	const id = "run-1-gen-1-launch-1"
+	if _, _, err := router.Route(context.Background(), id, "review-fix"); !errors.Is(err, ErrDeferred) {
+		t.Fatalf("first Route error = %v, want a deferral", err)
+	}
+
+	// A deferral must not have stranded the id: the same attempt retries after
+	// the next refresh.
+	assignment, selected, err := router.Route(context.Background(), id, "review-fix")
+	if err != nil || !selected {
+		t.Fatalf("retry after a deferral: selected=%v err=%v", selected, err)
+	}
+	if assignment.Profile.ID != "pi-grok" {
+		t.Fatalf("retry acquired profile %q, want pi-grok", assignment.Profile.ID)
+	}
+	if err := router.Finish(context.Background(), id, OutcomeSuccess); err != nil {
+		t.Fatalf("finish the retried launch: %v", err)
+	}
+}
+
+// TestRouter_FinishRefusesAnIDThatOnlyEverReserved proves an in-flight
+// reservation is not reportable: the hook has not answered, so there is no
+// identity to bill and nothing the controller is counting.
+func TestRouter_FinishRefusesAnIDThatOnlyEverReserved(t *testing.T) {
+	entered := make(chan struct{})
+	proceed := make(chan struct{})
+	rh := &recordingHook{
+		reply: func(verb Verb, req Request) Response {
+			if verb == VerbFinish {
+				return Response{Result: resultClosed}
+			}
+			close(entered)
+			<-proceed
+			return Response{Result: resultSelected, RouteID: "pi-grok"}
+		},
+	}
+	router := testRouter(t, rh, piGrokProfile())
+
+	const id = "run-1-gen-1-launch-1"
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := router.Route(context.Background(), id, "review-fix")
+		done <- err
+	}()
+	<-entered
+
+	if err := router.Finish(context.Background(), id, OutcomeSuccess); err == nil {
+		t.Fatal("Finish reported an assignment whose acquire had not answered yet")
+	}
+	close(proceed)
+	if err := <-done; err != nil {
+		t.Fatalf("Route after the refused finish: %v", err)
+	}
+	if err := router.Finish(context.Background(), id, OutcomeSuccess); err != nil {
+		t.Fatalf("finish the acquired assignment: %v", err)
+	}
 }

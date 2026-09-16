@@ -168,7 +168,15 @@ func (sctx *StepContext) acquireRoute(ctx context.Context, opts *agent.RunOpts, 
 		// The process never started, so the route consumed nothing. Report
 		// that distinctly: a controller counting in-flight work must release
 		// this assignment rather than bill a turn that never ran.
-		r.finish(ctx, invocation, routing.OutcomeLaunchFailed)
+		//
+		// This is the only report this assignment will ever get: no release
+		// backstop is installed on this path, because acquire returns an error
+		// and the caller never reaches its deferred cleanup. So it must not
+		// ride the caller's context. A cancellation arriving between Route
+		// selecting a profile and the build failing would otherwise reject the
+		// one report and leave the controller counting the assignment as
+		// running forever.
+		r.finish(context.WithoutCancel(ctx), invocation, routing.OutcomeLaunchFailed)
 		return nil, false, nil, fmt.Errorf("create routed agent for profile %s: %w", assignment.Profile.ID, err)
 	}
 

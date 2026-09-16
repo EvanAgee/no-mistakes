@@ -148,8 +148,7 @@ func TestRoutedSessions_SwitchingServiceNeverCarriesThePriorSessionID(t *testing
 		svc := newProfileAgent(profile, counter)
 		prompt := fmt.Sprintf("fix round %d: apply finding F-%d in worktree /w/run-1", i+1, i+1)
 
-		result, err := manager.Run(context.Background(), svc, SessionRoleFixer,
-			routing.ProfileKey(profile), agent.RunOpts{Prompt: prompt, Purpose: "review-fix"}, nil)
+		result, err := manager.Run(context.Background(), fixedLauncher(svc, routing.ProfileKey(profile)), SessionRoleFixer, agent.RunOpts{Prompt: prompt, Purpose: "review-fix"}, nil)
 		if err != nil {
 			t.Fatalf("turn %d on %s: %v", i+1, profile.ID, err)
 		}
@@ -195,15 +194,13 @@ func TestRoutedSessions_PiGrokAndPiDeepSeekNeverShareASession(t *testing.T) {
 	manager := NewRunSessions(d, run.ID, newFakeSessionAgent(), true)
 
 	grok := newProfileAgent(routingPiGrokProfile(), counter)
-	grokResult, err := manager.Run(context.Background(), grok, SessionRoleFixer,
-		routing.ProfileKey(routingPiGrokProfile()), agent.RunOpts{Prompt: "fix on grok"}, nil)
+	grokResult, err := manager.Run(context.Background(), fixedLauncher(grok, routing.ProfileKey(routingPiGrokProfile())), SessionRoleFixer, agent.RunOpts{Prompt: "fix on grok"}, nil)
 	if err != nil {
 		t.Fatalf("grok turn: %v", err)
 	}
 
 	deepseek := newProfileAgent(routingPiDeepSeekProfile(), counter)
-	if _, err := manager.Run(context.Background(), deepseek, SessionRoleFixer,
-		routing.ProfileKey(routingPiDeepSeekProfile()), agent.RunOpts{Prompt: "fix on deepseek"}, nil); err != nil {
+	if _, err := manager.Run(context.Background(), fixedLauncher(deepseek, routing.ProfileKey(routingPiDeepSeekProfile())), SessionRoleFixer, agent.RunOpts{Prompt: "fix on deepseek"}, nil); err != nil {
 		t.Fatalf("deepseek turn: %v", err)
 	}
 
@@ -228,7 +225,7 @@ func TestRoutedSessions_ConsecutiveSameProfileTurnsReuseTheExactID(t *testing.T)
 	grokKey := routing.ProfileKey(routingPiGrokProfile())
 
 	first := newProfileAgent(routingPiGrokProfile(), counter)
-	firstResult, err := manager.Run(context.Background(), first, SessionRoleFixer, grokKey,
+	firstResult, err := manager.Run(context.Background(), fixedLauncher(first, grokKey), SessionRoleFixer,
 		agent.RunOpts{Prompt: "fix round 1"}, nil)
 	if err != nil {
 		t.Fatalf("first turn: %v", err)
@@ -239,7 +236,7 @@ func TestRoutedSessions_ConsecutiveSameProfileTurnsReuseTheExactID(t *testing.T)
 
 	for round := 2; round <= 4; round++ {
 		next := newProfileAgent(routingPiGrokProfile(), counter)
-		if _, err := manager.Run(context.Background(), next, SessionRoleFixer, grokKey,
+		if _, err := manager.Run(context.Background(), fixedLauncher(next, grokKey), SessionRoleFixer,
 			agent.RunOpts{Prompt: fmt.Sprintf("fix round %d", round)}, nil); err != nil {
 			t.Fatalf("round %d: %v", round, err)
 		}
@@ -264,13 +261,13 @@ func TestRoutedSessions_AfterASwitchTheNextMatchingTurnResumesTheNewID(t *testin
 	codexKey := routing.ProfileKey(routingCodexProfile())
 
 	claude := newProfileAgent(routingClaudeProfile(), counter)
-	if _, err := manager.Run(context.Background(), claude, SessionRoleFixer, claudeKey,
+	if _, err := manager.Run(context.Background(), fixedLauncher(claude, claudeKey), SessionRoleFixer,
 		agent.RunOpts{Prompt: "fix on claude"}, nil); err != nil {
 		t.Fatalf("claude turn: %v", err)
 	}
 
 	codexFirst := newProfileAgent(routingCodexProfile(), counter)
-	codexResult, err := manager.Run(context.Background(), codexFirst, SessionRoleFixer, codexKey,
+	codexResult, err := manager.Run(context.Background(), fixedLauncher(codexFirst, codexKey), SessionRoleFixer,
 		agent.RunOpts{Prompt: "fix on codex"}, nil)
 	if err != nil {
 		t.Fatalf("codex turn: %v", err)
@@ -283,7 +280,7 @@ func TestRoutedSessions_AfterASwitchTheNextMatchingTurnResumesTheNewID(t *testin
 	}
 
 	codexSecond := newProfileAgent(routingCodexProfile(), counter)
-	if _, err := manager.Run(context.Background(), codexSecond, SessionRoleFixer, codexKey,
+	if _, err := manager.Run(context.Background(), fixedLauncher(codexSecond, codexKey), SessionRoleFixer,
 		agent.RunOpts{Prompt: "another fix on codex"}, nil); err != nil {
 		t.Fatalf("second codex turn: %v", err)
 	}
@@ -302,7 +299,7 @@ func TestRoutedSessions_ReuseSurvivesAManagerAndDatabaseReopen(t *testing.T) {
 
 	manager := NewRunSessions(d, run.ID, newFakeSessionAgent(), true)
 	svc := newProfileAgent(routingPiGrokProfile(), counter)
-	minted, err := manager.Run(context.Background(), svc, SessionRoleFixer, grokKey,
+	minted, err := manager.Run(context.Background(), fixedLauncher(svc, grokKey), SessionRoleFixer,
 		agent.RunOpts{Prompt: "fix before restart"}, nil)
 	if err != nil {
 		t.Fatalf("first turn: %v", err)
@@ -312,7 +309,7 @@ func TestRoutedSessions_ReuseSurvivesAManagerAndDatabaseReopen(t *testing.T) {
 	// a restart resumes a parked run.
 	restarted := NewRunSessions(d, run.ID, newFakeSessionAgent(), true)
 	after := newProfileAgent(routingPiGrokProfile(), counter)
-	if _, err := restarted.Run(context.Background(), after, SessionRoleFixer, grokKey,
+	if _, err := restarted.Run(context.Background(), fixedLauncher(after, grokKey), SessionRoleFixer,
 		agent.RunOpts{Prompt: "fix after restart"}, nil); err != nil {
 		t.Fatalf("turn after restart: %v", err)
 	}
@@ -323,8 +320,7 @@ func TestRoutedSessions_ReuseSurvivesAManagerAndDatabaseReopen(t *testing.T) {
 	// And the same restart must still refuse the id on a different profile.
 	restartedAgain := NewRunSessions(d, run.ID, newFakeSessionAgent(), true)
 	other := newProfileAgent(routingPiDeepSeekProfile(), counter)
-	if _, err := restartedAgain.Run(context.Background(), other, SessionRoleFixer,
-		routing.ProfileKey(routingPiDeepSeekProfile()), agent.RunOpts{Prompt: "fix on deepseek"}, nil); err != nil {
+	if _, err := restartedAgain.Run(context.Background(), fixedLauncher(other, routing.ProfileKey(routingPiDeepSeekProfile())), SessionRoleFixer, agent.RunOpts{Prompt: "fix on deepseek"}, nil); err != nil {
 		t.Fatalf("deepseek turn after restart: %v", err)
 	}
 	if got := other.lastSession(); got == nil || got.ID != "" {
@@ -415,15 +411,13 @@ func TestRoutedSessions_KeyComponentTable(t *testing.T) {
 			manager := NewRunSessions(d, run.ID, newFakeSessionAgent(), true)
 
 			firstSvc := newProfileAgent(base, counter)
-			minted, err := manager.Run(context.Background(), firstSvc, SessionRoleFixer,
-				routing.ProfileKey(base), agent.RunOpts{Prompt: "first fix"}, nil)
+			minted, err := manager.Run(context.Background(), fixedLauncher(firstSvc, routing.ProfileKey(base)), SessionRoleFixer, agent.RunOpts{Prompt: "first fix"}, nil)
 			if err != nil {
 				t.Fatalf("first turn: %v", err)
 			}
 
 			nextSvc := newProfileAgent(tc.next, counter)
-			if _, err := manager.Run(context.Background(), nextSvc, SessionRoleFixer,
-				routing.ProfileKey(tc.next), agent.RunOpts{Prompt: "second fix"}, nil); err != nil {
+			if _, err := manager.Run(context.Background(), fixedLauncher(nextSvc, routing.ProfileKey(tc.next)), SessionRoleFixer, agent.RunOpts{Prompt: "second fix"}, nil); err != nil {
 				t.Fatalf("second turn: %v", err)
 			}
 
@@ -456,8 +450,7 @@ func TestRoutedSessions_QuotaRefreshAndCredentialRotationPreserveReuse(t *testin
 
 	profile := routingPiGrokProfile()
 	svc := newProfileAgent(profile, counter)
-	minted, err := manager.Run(context.Background(), svc, SessionRoleFixer,
-		routing.ProfileKey(profile), agent.RunOpts{Prompt: "fix before refresh"}, nil)
+	minted, err := manager.Run(context.Background(), fixedLauncher(svc, routing.ProfileKey(profile)), SessionRoleFixer, agent.RunOpts{Prompt: "fix before refresh"}, nil)
 	if err != nil {
 		t.Fatalf("first turn: %v", err)
 	}
@@ -473,8 +466,7 @@ func TestRoutedSessions_QuotaRefreshAndCredentialRotationPreserveReuse(t *testin
 	}
 
 	after := newProfileAgent(refreshed, counter)
-	if _, err := manager.Run(context.Background(), after, SessionRoleFixer,
-		routing.ProfileKey(refreshed), agent.RunOpts{Prompt: "fix after refresh"}, nil); err != nil {
+	if _, err := manager.Run(context.Background(), fixedLauncher(after, routing.ProfileKey(refreshed)), SessionRoleFixer, agent.RunOpts{Prompt: "fix after refresh"}, nil); err != nil {
 		t.Fatalf("turn after refresh: %v", err)
 	}
 	if got := after.lastSession(); got == nil || got.ID != minted.SessionID {
@@ -505,8 +497,7 @@ func TestRoutedSessions_LegacyRowStartsFreshOnceWithoutFailingTheRun(t *testing.
 	manager := NewRunSessions(d, run.ID, newFakeSessionAgent(), true)
 	profile := routingPiGrokProfile()
 	svc := newProfileAgent(profile, counter)
-	minted, err := manager.Run(context.Background(), svc, SessionRoleFixer,
-		routing.ProfileKey(profile), agent.RunOpts{Prompt: "first routed fix"}, nil)
+	minted, err := manager.Run(context.Background(), fixedLauncher(svc, routing.ProfileKey(profile)), SessionRoleFixer, agent.RunOpts{Prompt: "first routed fix"}, nil)
 	if err != nil {
 		t.Fatalf("a legacy row must not fail the run: %v", err)
 	}
@@ -534,8 +525,7 @@ func TestRoutedSessions_LegacyRowStartsFreshOnceWithoutFailingTheRun(t *testing.
 	}
 
 	next := newProfileAgent(profile, counter)
-	if _, err := manager.Run(context.Background(), next, SessionRoleFixer,
-		routing.ProfileKey(profile), agent.RunOpts{Prompt: "second routed fix"}, nil); err != nil {
+	if _, err := manager.Run(context.Background(), fixedLauncher(next, routing.ProfileKey(profile)), SessionRoleFixer, agent.RunOpts{Prompt: "second routed fix"}, nil); err != nil {
 		t.Fatalf("second turn: %v", err)
 	}
 	if got := next.lastSession(); got == nil || got.ID != minted.SessionID {
@@ -562,8 +552,7 @@ func TestRoutedSessions_RemovedAdapterRowStartsFreshWithoutFailingRecovery(t *te
 	manager := NewRunSessions(d, run.ID, newFakeSessionAgent(), true)
 	profile := routingClaudeProfile()
 	svc := newProfileAgent(profile, counter)
-	if _, err := manager.Run(context.Background(), svc, SessionRoleFixer,
-		routing.ProfileKey(profile), agent.RunOpts{Prompt: "fix after the adapter was removed"}, nil); err != nil {
+	if _, err := manager.Run(context.Background(), fixedLauncher(svc, routing.ProfileKey(profile)), SessionRoleFixer, agent.RunOpts{Prompt: "fix after the adapter was removed"}, nil); err != nil {
 		t.Fatalf("a removed-adapter row must not fail recovery: %v", err)
 	}
 	if got := svc.lastSession(); got == nil || got.ID != "" {
@@ -588,15 +577,13 @@ func TestRoutedSessions_UnknownProfileKeyNeverMatches(t *testing.T) {
 	}
 
 	first := newProfileAgent(unknown, counter)
-	minted, err := manager.Run(context.Background(), first, SessionRoleFixer,
-		routing.ProfileKey(unknown), agent.RunOpts{Prompt: "first fix"}, nil)
+	minted, err := manager.Run(context.Background(), fixedLauncher(first, routing.ProfileKey(unknown)), SessionRoleFixer, agent.RunOpts{Prompt: "first fix"}, nil)
 	if err != nil {
 		t.Fatalf("first turn: %v", err)
 	}
 
 	second := newProfileAgent(unknown, counter)
-	if _, err := manager.Run(context.Background(), second, SessionRoleFixer,
-		routing.ProfileKey(unknown), agent.RunOpts{Prompt: "second fix"}, nil); err != nil {
+	if _, err := manager.Run(context.Background(), fixedLauncher(second, routing.ProfileKey(unknown)), SessionRoleFixer, agent.RunOpts{Prompt: "second fix"}, nil); err != nil {
 		t.Fatalf("second turn: %v", err)
 	}
 	if got := second.lastSession(); got == nil || got.ID != "" {
@@ -618,9 +605,7 @@ func TestRoutedSessions_UnroutedReuseIsUnchanged(t *testing.T) {
 	manager := NewRunSessions(d, run.ID, fake, true)
 
 	for round := 1; round <= 3; round++ {
-		if _, err := manager.Run(context.Background(), fake, SessionRoleFixer,
-			routing.UnroutedProfileKey,
-			agent.RunOpts{Prompt: fmt.Sprintf("fix round %d", round)}, nil); err != nil {
+		if _, err := manager.Run(context.Background(), fixedLauncher(fake, routing.UnroutedProfileKey), SessionRoleFixer, agent.RunOpts{Prompt: fmt.Sprintf("fix round %d", round)}, nil); err != nil {
 			t.Fatalf("round %d: %v", round, err)
 		}
 	}
@@ -655,15 +640,13 @@ func TestRoutedSessions_MismatchedRecordIsForgottenNotLeftBehind(t *testing.T) {
 	manager := NewRunSessions(d, run.ID, newFakeSessionAgent(), true)
 
 	grok := newProfileAgent(routingPiGrokProfile(), counter)
-	grokMinted, err := manager.Run(context.Background(), grok, SessionRoleFixer,
-		routing.ProfileKey(routingPiGrokProfile()), agent.RunOpts{Prompt: "fix on grok"}, nil)
+	grokMinted, err := manager.Run(context.Background(), fixedLauncher(grok, routing.ProfileKey(routingPiGrokProfile())), SessionRoleFixer, agent.RunOpts{Prompt: "fix on grok"}, nil)
 	if err != nil {
 		t.Fatalf("grok turn: %v", err)
 	}
 
 	deepseek := newProfileAgent(routingPiDeepSeekProfile(), counter)
-	deepseekMinted, err := manager.Run(context.Background(), deepseek, SessionRoleFixer,
-		routing.ProfileKey(routingPiDeepSeekProfile()), agent.RunOpts{Prompt: "fix on deepseek"}, nil)
+	deepseekMinted, err := manager.Run(context.Background(), fixedLauncher(deepseek, routing.ProfileKey(routingPiDeepSeekProfile())), SessionRoleFixer, agent.RunOpts{Prompt: "fix on deepseek"}, nil)
 	if err != nil {
 		t.Fatalf("deepseek turn: %v", err)
 	}
@@ -698,8 +681,7 @@ func TestRoutedSessions_FailedResumeStillRetriesInAFreshSession(t *testing.T) {
 	key := routing.ProfileKey(profile)
 
 	first := newProfileAgent(profile, counter)
-	minted, err := manager.Run(context.Background(), first, SessionRoleFixer, key,
-		agent.RunOpts{Prompt: "fix round 1"}, nil)
+	minted, err := manager.Run(context.Background(), fixedLauncher(first, key), SessionRoleFixer, agent.RunOpts{Prompt: "fix round 1"}, nil)
 	if err != nil {
 		t.Fatalf("first turn: %v", err)
 	}
@@ -708,8 +690,7 @@ func TestRoutedSessions_FailedResumeStillRetriesInAFreshSession(t *testing.T) {
 	second := newProfileAgent(profile, counter)
 	second.failResumes[minted.SessionID] = fmt.Errorf("session %s not found", minted.SessionID)
 
-	if _, err := manager.Run(context.Background(), second, SessionRoleFixer, key,
-		agent.RunOpts{Prompt: "fix round 2"}, nil); err != nil {
+	if _, err := manager.Run(context.Background(), fixedLauncher(second, key), SessionRoleFixer, agent.RunOpts{Prompt: "fix round 2"}, nil); err != nil {
 		t.Fatalf("a failed resume must retry, not fail: %v", err)
 	}
 
@@ -755,15 +736,13 @@ func TestRoutedSessions_RolesStayIsolatedUnderRouting(t *testing.T) {
 	key := routing.ProfileKey(profile)
 
 	fixerSvc := newProfileAgent(profile, counter)
-	fixer, err := manager.Run(context.Background(), fixerSvc, SessionRoleFixer, key,
-		agent.RunOpts{Prompt: "fix"}, nil)
+	fixer, err := manager.Run(context.Background(), fixedLauncher(fixerSvc, key), SessionRoleFixer, agent.RunOpts{Prompt: "fix"}, nil)
 	if err != nil {
 		t.Fatalf("fixer turn: %v", err)
 	}
 
 	reviewerSvc := newProfileAgent(profile, counter)
-	reviewer, err := manager.Run(context.Background(), reviewerSvc, SessionRoleReviewer, key,
-		agent.RunOpts{Prompt: "review"}, nil)
+	reviewer, err := manager.Run(context.Background(), fixedLauncher(reviewerSvc, key), SessionRoleReviewer, agent.RunOpts{Prompt: "review"}, nil)
 	if err != nil {
 		t.Fatalf("reviewer turn: %v", err)
 	}
@@ -807,8 +786,7 @@ func TestRoutedSessions_UnroutedRunResumesALegacyRowAcrossAnUpgrade(t *testing.T
 
 	fake := newFakeSessionAgent()
 	manager := NewRunSessions(d, run.ID, fake, true)
-	if _, err := manager.Run(context.Background(), fake, SessionRoleFixer,
-		routing.UnroutedProfileKey, agent.RunOpts{Prompt: "fix after upgrade"}, nil); err != nil {
+	if _, err := manager.Run(context.Background(), fixedLauncher(fake, routing.UnroutedProfileKey), SessionRoleFixer, agent.RunOpts{Prompt: "fix after upgrade"}, nil); err != nil {
 		t.Fatalf("resume after upgrade: %v", err)
 	}
 
@@ -833,8 +811,7 @@ func TestRoutedSessions_RoutedTurnNeverResumesALegacyRow(t *testing.T) {
 	manager := NewRunSessions(d, run.ID, newFakeSessionAgent(), true)
 	profile := routingPiGrokProfile()
 	svc := newProfileAgent(profile, counter)
-	if _, err := manager.Run(context.Background(), svc, SessionRoleFixer,
-		routing.ProfileKey(profile), agent.RunOpts{Prompt: "routed fix"}, nil); err != nil {
+	if _, err := manager.Run(context.Background(), fixedLauncher(svc, routing.ProfileKey(profile)), SessionRoleFixer, agent.RunOpts{Prompt: "routed fix"}, nil); err != nil {
 		t.Fatalf("routed turn: %v", err)
 	}
 
@@ -863,8 +840,7 @@ func TestRoutedSessions_UnknownKeyTurnLeavesNoLegacyLookingRow(t *testing.T) {
 
 	routed := NewRunSessions(d, run.ID, newFakeSessionAgent(), true)
 	deepseek := newProfileAgent(unknown, counter)
-	minted, err := routed.Run(context.Background(), deepseek, SessionRoleFixer,
-		routing.ProfileKey(unknown), agent.RunOpts{Prompt: "fix on an unestablished identity"}, nil)
+	minted, err := routed.Run(context.Background(), fixedLauncher(deepseek, routing.ProfileKey(unknown)), SessionRoleFixer, agent.RunOpts{Prompt: "fix on an unestablished identity"}, nil)
 	if err != nil {
 		t.Fatalf("routed turn: %v", err)
 	}
@@ -886,8 +862,7 @@ func TestRoutedSessions_UnknownKeyTurnLeavesNoLegacyLookingRow(t *testing.T) {
 	// carries the unrouted key and the run's own default adapter launches.
 	fake := newFakeSessionAgent()
 	unrouted := NewRunSessions(d, run.ID, fake, true)
-	if _, err := unrouted.Run(context.Background(), fake, SessionRoleFixer,
-		routing.UnroutedProfileKey, agent.RunOpts{Prompt: "fix with routing off"}, nil); err != nil {
+	if _, err := unrouted.Run(context.Background(), fixedLauncher(fake, routing.UnroutedProfileKey), SessionRoleFixer, agent.RunOpts{Prompt: "fix with routing off"}, nil); err != nil {
 		t.Fatalf("unrouted turn: %v", err)
 	}
 	if got := fake.calls[0].session; got == nil || got.ID != "" {
@@ -910,8 +885,7 @@ func TestRoutedSessions_UnknownKeyTurnDropsAnEarlierResumableRow(t *testing.T) {
 
 	known := routingPiDeepSeekProfile()
 	established := newProfileAgent(known, counter)
-	if _, err := manager.Run(context.Background(), established, SessionRoleFixer,
-		routing.ProfileKey(known), agent.RunOpts{Prompt: "establish a session"}, nil); err != nil {
+	if _, err := manager.Run(context.Background(), fixedLauncher(established, routing.ProfileKey(known)), SessionRoleFixer, agent.RunOpts{Prompt: "establish a session"}, nil); err != nil {
 		t.Fatalf("established turn: %v", err)
 	}
 
@@ -920,8 +894,7 @@ func TestRoutedSessions_UnknownKeyTurnDropsAnEarlierResumableRow(t *testing.T) {
 		t.Fatal("this test requires a profile whose identity cannot be established")
 	}
 	stranger := newProfileAgent(unknown, counter)
-	if _, err := manager.Run(context.Background(), stranger, SessionRoleFixer,
-		routing.ProfileKey(unknown), agent.RunOpts{Prompt: "fix on an unestablished identity"}, nil); err != nil {
+	if _, err := manager.Run(context.Background(), fixedLauncher(stranger, routing.ProfileKey(unknown)), SessionRoleFixer, agent.RunOpts{Prompt: "fix on an unestablished identity"}, nil); err != nil {
 		t.Fatalf("unknown-identity turn: %v", err)
 	}
 
@@ -932,6 +905,106 @@ func TestRoutedSessions_UnknownKeyTurnDropsAnEarlierResumableRow(t *testing.T) {
 	for _, row := range rows {
 		if row.Role == string(SessionRoleFixer) {
 			t.Fatalf("the earlier row must not survive an unknown-identity turn, got %+v", row)
+		}
+	}
+}
+
+// TestRoutedSessions_ResumeAndFreshFallbackEachAcquireTheirOwnAssignment
+// proves one turn's TWO adapter launches are billed as two.
+//
+// A durable-session turn whose resume fails re-runs the same prompt in a fresh
+// session, which is a second real process consuming a second turn of the
+// route's quota. The controller treats a repeated assignment id as the SAME
+// launch, so acquiring once for the whole turn told it one turn was spent when
+// two were, and reported only one outcome.
+func TestRoutedSessions_ResumeAndFreshFallbackEachAcquireTheirOwnAssignment(t *testing.T) {
+	d, run := sessionTestDB(t)
+	profile := routingPiGrokProfile()
+	counter := newMintCounter()
+
+	// One adapter serves every launch, and the second launch's resume fails,
+	// which is what drives the fresh-session fallback.
+	svc := newProfileAgent(profile, counter)
+
+	transport := &fakeHookTransport{reply: selectByID(profile.ID)}
+	routed := testRouting(t, transport, []routing.Profile{profile},
+		func(routing.Profile) (agent.Agent, error) { return svc, nil })
+
+	sctx := &StepContext{
+		Ctx:       context.Background(),
+		Agent:     svc,
+		Sessions:  NewRunSessions(d, run.ID, svc, true),
+		Routing:   routed,
+		WrapAgent: testStepHarness,
+	}
+
+	minted, err := sctx.RunAgentSessionContext(context.Background(), SessionRoleFixer,
+		agent.RunOpts{Prompt: "fix round 1", Purpose: "review-fix"})
+	if err != nil {
+		t.Fatalf("first turn: %v", err)
+	}
+	// The provider has forgotten the session by the next turn.
+	svc.failResumes[minted.SessionID] = fmt.Errorf("session %s not found", minted.SessionID)
+
+	if _, err := sctx.RunAgentSessionContext(context.Background(), SessionRoleFixer,
+		agent.RunOpts{Prompt: "fix round 2", Purpose: "review-fix"}); err != nil {
+		t.Fatalf("a failed resume must retry, not fail: %v", err)
+	}
+
+	// Three real adapter launches happened: turn 1, turn 2's resume attempt,
+	// and turn 2's fresh fallback.
+	svc.mu.Lock()
+	launches := len(svc.calls)
+	svc.mu.Unlock()
+	if launches != 3 {
+		t.Fatalf("adapter launches = %d, want 3 (turn 1, a failed resume, its fresh retry)", launches)
+	}
+
+	var acquires, finishes []routing.Request
+	for _, call := range transport.seen() {
+		switch call.verb {
+		case routing.VerbAcquire:
+			acquires = append(acquires, call.req)
+		case routing.VerbFinish:
+			finishes = append(finishes, call.req)
+		}
+	}
+	if len(acquires) != launches {
+		t.Fatalf("acquires = %d for %d real launches; every launch must have its own assignment",
+			len(acquires), launches)
+	}
+	if len(finishes) != launches {
+		t.Fatalf("finishes = %d for %d real launches; every launch must report its own outcome",
+			len(finishes), launches)
+	}
+
+	seen := map[string]bool{}
+	for _, req := range acquires {
+		if seen[req.AssignmentID] {
+			t.Fatalf("assignment id %q was acquired twice; the controller counts that as ONE launch",
+				req.AssignmentID)
+		}
+		seen[req.AssignmentID] = true
+	}
+	for _, req := range finishes {
+		if !seen[req.AssignmentID] {
+			t.Fatalf("finish reported assignment %q that was never acquired", req.AssignmentID)
+		}
+	}
+
+	// Each launch reports what actually happened to IT, not one verdict for
+	// the whole turn: the first turn succeeded, the failed resume is reported
+	// as its own failure, and the fresh retry that replaced it as its own
+	// success. Folding them into one assignment could only have reported one
+	// of the three.
+	want := []routing.Outcome{
+		routing.OutcomeSuccess,
+		routing.OutcomeLaunchFailed,
+		routing.OutcomeSuccess,
+	}
+	for i, req := range finishes {
+		if req.Outcome != want[i] {
+			t.Fatalf("finish %d outcome = %q, want %q", i, req.Outcome, want[i])
 		}
 	}
 }

@@ -133,10 +133,37 @@ func (r *Router) Route(ctx context.Context, assignmentID, role string) (Assignme
 		r.mu.Unlock()
 		return Assignment{}, false, fmt.Errorf("routing: assignment %q is already open", assignmentID)
 	}
+	// Reserve the id before releasing the lock. Checking membership and then
+	// recording it only after the hook answers leaves an unguarded window in
+	// which two concurrent Routes for one id both pass the check, both send an
+	// acquire for the same (assignment_id, owner.identity) the controller
+	// treats as one, and the second overwrites the first's profile - so the
+	// finish that follows would report an identity that never ran, and the
+	// other launch could never be reported at all. The reservation makes the
+	// single-use guard this router documents hold against any caller, not just
+	// one that happens to mint distinct ids.
+	//
+	// It is a reservation, not a result: the profile is unknown until the hook
+	// answers, so the placeholder carries no identity. A validated Profile
+	// always has a nonempty ID, so an empty one marks the reservation
+	// unambiguously, and Finish refuses to report it.
+	r.open[assignmentID] = Profile{}
 	r.mu.Unlock()
+
+	// Every path from here that does not produce an admitted assignment must
+	// drop the reservation, so a deferral stays retriable and a corrected retry
+	// is a fresh acquire rather than a replay.
+	release := func() {
+		r.mu.Lock()
+		if profile, live := r.open[assignmentID]; live && profile.ID == "" {
+			delete(r.open, assignmentID)
+		}
+		r.mu.Unlock()
+	}
 
 	allowed := r.allowedFor(role)
 	if len(allowed) == 0 {
+		release()
 		return Assignment{}, false, fmt.Errorf("%w: %s. Configured profiles: %s. Either add this role to one profile's `roles`, or leave one profile unrestricted so it serves every role",
 			ErrNoAllowedProfile, describeRole(role), strings.Join(r.profileIDs(), ", "))
 	}
@@ -152,6 +179,7 @@ func (r *Router) Route(ctx context.Context, assignmentID, role string) (Assignme
 		// other refusals (already-closed, a controller error, an unoffered
 		// route) leave the id untouched too, so a corrected retry is a fresh
 		// acquire rather than a replay.
+		release()
 		return Assignment{}, false, err
 	}
 
@@ -193,6 +221,13 @@ func (r *Router) Finish(ctx context.Context, assignmentID string, outcome Outcom
 
 	r.mu.Lock()
 	profile, live := r.open[assignmentID]
+	// A placeholder profile is Route's in-flight reservation, not an acquired
+	// assignment: the hook has not answered yet, so there is no identity to
+	// report and nothing the controller is counting. Treat it exactly like an
+	// id this run never acquired.
+	if live && profile.ID == "" {
+		live = false
+	}
 	if !live {
 		_, spent := r.closed[assignmentID]
 		r.mu.Unlock()

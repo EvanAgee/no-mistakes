@@ -153,7 +153,7 @@ func TestPerfRecording_ResumedSessionRecordsPerRoundDeltas(t *testing.T) {
 			Purpose:  "review",
 			Workload: &agent.InvocationWorkload{Files: 4, Lines: 120},
 		}
-		if _, err := sessions.Run(context.Background(), wrapped, SessionRoleReviewer, routing.UnroutedProfileKey, opts, nil); err != nil {
+		if _, err := sessions.Run(context.Background(), fixedLauncher(wrapped, routing.UnroutedProfileKey), SessionRoleReviewer, opts, nil); err != nil {
 			t.Fatalf("round %d: %v", r, err)
 		}
 	}
@@ -257,7 +257,7 @@ func TestPerfRecording_FallbackRecordsReason(t *testing.T) {
 
 	for r := 1; r <= 2; r++ {
 		roundNum = r
-		if _, err := sessions.Run(context.Background(), wrapped, SessionRoleFixer, routing.UnroutedProfileKey, agent.RunOpts{Purpose: "review-fix"}, nil); err != nil {
+		if _, err := sessions.Run(context.Background(), fixedLauncher(wrapped, routing.UnroutedProfileKey), SessionRoleFixer, agent.RunOpts{Purpose: "review-fix"}, nil); err != nil {
 			t.Fatalf("round %d: %v", r, err)
 		}
 	}
