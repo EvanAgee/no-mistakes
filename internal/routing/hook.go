@@ -380,14 +380,17 @@ func (h *Hook) call(ctx context.Context, verb Verb, req Request) (Response, erro
 	if resp, ok := decodeResponse(stdout); ok && resp.Result == resultError {
 		return resp, nil
 	}
+	// The reader breaks a flooding hook off past the cap, which surfaces as a
+	// run error. Report that as the size refusal it is rather than as whatever
+	// the broken pipe made the process exit with.
+	if len(stdout) > maxResponseBytes {
+		return Response{}, fmt.Errorf("routing: assignment hook %s returned more than %d bytes", verb, maxResponseBytes)
+	}
 	if runErr != nil {
 		if errors.Is(callCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil {
 			return Response{}, fmt.Errorf("routing: assignment hook %s timed out after %s", verb, timeout)
 		}
 		return Response{}, fmt.Errorf("routing: assignment hook %s failed: %w", verb, runErr)
-	}
-	if len(stdout) > maxResponseBytes {
-		return Response{}, fmt.Errorf("routing: assignment hook %s returned more than %d bytes", verb, maxResponseBytes)
 	}
 
 	resp, err := strictDecodeResponse(stdout)
@@ -432,9 +435,19 @@ func decodeResponse(stdout []byte) (Response, bool) {
 func execHook(ctx context.Context, path string, args []string, stdin []byte) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, path, args...)
 	cmd.Stdin = bytes.NewReader(stdin)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	// Both streams are capped where the reading actually happens, not after.
+	// Checking the length of an already-buffered response would enforce
+	// nothing: a hook that streams gigabytes is resident in the daemon's heap
+	// long before any check runs, and the timeout does not help because such a
+	// process exits normally. One byte past the limit is kept so the caller can
+	// still tell "too long" from "exactly at the limit".
+	stdout := &cappedBuffer{limit: maxResponseBytes + 1, refuseOverflow: true}
+	// stderr is bounded too, but it discards the excess instead of refusing it:
+	// it is only ever quoted as diagnostic text, and breaking a hook's pipe for
+	// being chatty would turn a successful call into a failure.
+	stderr := &cappedBuffer{limit: 4 << 10}
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
 	if err := cmd.Run(); err != nil {
 		if text := strings.TrimSpace(stderr.String()); text != "" {
 			return stdout.Bytes(), fmt.Errorf("%w: %s", err, truncate(strings.Join(strings.Fields(text), " "), 400))
@@ -443,6 +456,50 @@ func execHook(ctx context.Context, path string, args []string, stdin []byte) ([]
 	}
 	return stdout.Bytes(), nil
 }
+
+// cappedBuffer collects at most limit bytes.
+//
+// With refuseOverflow set, the first byte past the limit is answered with a
+// write error. That is deliberate: os/exec's copier stops on a write error and
+// closes its end of the pipe, so a flooding hook is broken off at the source
+// rather than drained politely into the daemon's heap. What was kept is still
+// returned, so an oversized reply is reported as oversized rather than as a
+// lost stream.
+//
+// Without it the excess is discarded silently, which is what a stream that is
+// only ever quoted as diagnostic text needs: bounding memory there must not
+// turn a chatty but successful call into a failed one.
+type cappedBuffer struct {
+	limit          int
+	refuseOverflow bool
+	buf            bytes.Buffer
+}
+
+var errCappedBufferFull = errors.New("routing: assignment hook wrote more output than the limit allows")
+
+func (b *cappedBuffer) Write(p []byte) (int, error) {
+	room := b.limit - b.buf.Len()
+	if room <= 0 {
+		if b.refuseOverflow {
+			return 0, errCappedBufferFull
+		}
+		return len(p), nil
+	}
+	if len(p) <= room {
+		return b.buf.Write(p)
+	}
+	if _, err := b.buf.Write(p[:room]); err != nil {
+		return 0, err
+	}
+	if b.refuseOverflow {
+		return room, errCappedBufferFull
+	}
+	return len(p), nil
+}
+
+func (b *cappedBuffer) Bytes() []byte { return b.buf.Bytes() }
+
+func (b *cappedBuffer) String() string { return b.buf.String() }
 
 func evidence(reason string) string {
 	reason = strings.TrimSpace(reason)

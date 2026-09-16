@@ -17,7 +17,7 @@ type RunAgentSession struct {
 	Agent     string
 	SessionID string
 	// ProfileKey is the execution profile the session was minted under (see
-	// internal/pipeline/profilekey.go). It is empty for rows written before
+	// internal/routing/profile.go). It is empty for rows written before
 	// routing existed and for rows whose effective identity could not be
 	// established; such a row is readable but never resumed, because a native
 	// session id belongs to the exact adapter, provider, model and billing

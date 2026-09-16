@@ -50,7 +50,21 @@ func (m *RunManager) newRoutedAgentFactory(cfg *config.Config, evidenceRoot stri
 		if err != nil {
 			return nil, err
 		}
-		return agent.WithSteering(built, evidenceRoot), nil
+		routed := agent.WithSteering(built, evidenceRoot)
+		// Fail closed under the trusted opt-out, exactly as the default gate
+		// agent does (see newGateAgent): passing DisableProjectSettings into
+		// the constructor is a request, not a guarantee - an operator argument
+		// override that re-adds `project` or `local` setting sources defeats
+		// it. Without this check, routing would be the one path that launches
+		// an unverified harness in the target checkout with the repository's
+		// own project instructions loaded.
+		if cfg.DisableProjectSettings {
+			if err := agent.EnsureGateNeutralized(routed); err != nil {
+				_ = routed.Close()
+				return nil, err
+			}
+		}
+		return routed, nil
 	}
 }
 

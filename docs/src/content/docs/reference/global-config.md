@@ -631,7 +631,7 @@ The request carries the assignment id, this daemon's owner identity and generati
 
 ```json
 {
-  "assignment_id": "01JC...-launch-3",
+  "assignment_id": "01JC...-4242-1757951000000000000-launch-3",
   "owner": {"identity": "no-mistakes-daemon", "generation": "4242-1757951000000000000"},
   "routes": ["claude-opus", "codex-sol", "pi-grok"]
 }
@@ -657,6 +657,7 @@ It means no approved service is admissible right now, and the same work can be r
 `already-closed` means that exact launch already ran.
 It carries no route on purpose, so it can never authorize a second run of work the hook has already counted.
 Every launch gets its own assignment id, so a retry or a recovered turn is a new launch rather than a replay of a spent one.
+The id carries the daemon incarnation as well as the run, because the hook recognises a repeat id by (id, owner identity) and ignores the generation there: without it, a run resumed after a daemon restart would re-acquire the ids the previous incarnation already closed.
 
 When a turn ends, no-mistakes calls `finish` with the assignment id, the outcome, and the profile that actually ran.
 A completed turn reports `success`; anything else reports `launch-failed`, which releases the assignment without claiming the service is broken.
@@ -671,6 +672,10 @@ Each profile needs an `id` unique to this file, an `agent`, and a `provider`.
 It is never a credential and never the account a proxy currently has selected: keep it unchanged across token and account rotation, or every rotation throws away a reusable session.
 `model` and `effort` are the same harness-neutral knobs as [`agent_config`](#agent_config), validated against what that harness can express.
 `roles`, when set, restricts the profile to those pipeline duties; omit it to allow every role.
+
+Routing supersedes [`review_agents`](#review_agents) for every turn it serves.
+`review_agents` picks the reviewer and the fixer by the adapter you configured for each duty, but a routed turn runs whichever approved profile the hook selected, so that split no longer applies and one service can both prescribe and certify the same fixes.
+If you enable assignment and want the reviewer and the fixer kept independent, express that split again through per-profile `roles`: give the reviewing profiles `roles: [review]` and the fixing profiles the fix roles, so no profile is admissible for both.
 
 Session reuse follows the profile, not the adapter name.
 Consecutive turns on the same profile resume the same native session; a turn on a different profile always starts a fresh one, because a session id belongs to the exact service that minted it.

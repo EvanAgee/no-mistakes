@@ -332,6 +332,6 @@ var migrationStatements = []string{
 	// therefore never resumed - a session id is only reusable by the exact
 	// adapter/provider/model/billing route that minted it, and two aliases of
 	// the same adapter name prove nothing about that. See
-	// internal/pipeline/profilekey.go for what the key encodes.
+	// internal/routing/profile.go for what the key encodes.
 	`ALTER TABLE run_agent_sessions ADD COLUMN profile_key TEXT`,
 }

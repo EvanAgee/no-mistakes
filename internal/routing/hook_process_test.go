@@ -516,3 +516,51 @@ func TestHookProcess_EveryNormalizedOutcomeIsAcceptedByTheWire(t *testing.T) {
 		})
 	}
 }
+
+// TestHookProcess_FloodingStdoutIsBrokenOffAtTheCap proves the response bound
+// is enforced where the reading happens, not after it.
+//
+// A length check applied to an already-buffered response enforces nothing: a
+// malfunctioning hook that streams gigabytes is resident in the daemon's heap
+// long before any check can run, and the call timeout does not help because
+// such a process exits normally. The reader must therefore stop at the cap and
+// break the pipe, and the call must still fail closed with the size refusal.
+func TestHookProcess_FloodingStdoutIsBrokenOffAtTheCap(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the flooding fixture is a POSIX shell script")
+	}
+	script := filepath.Join(t.TempDir(), "flood.sh")
+	// Writes far more than the cap, in chunks, so the reader has to refuse
+	// mid-stream rather than after a single tidy write.
+	body := "#!/bin/sh\nchunk=$(head -c 65536 /dev/zero | tr '\\0' 'x')\ni=0\nwhile [ $i -lt 4096 ]; do printf '%s' \"$chunk\" || exit 0; i=$((i+1)); done\n"
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+
+	stdout, err := execHook(context.Background(), script, []string{"acquire"}, []byte("{}"))
+	if err == nil {
+		t.Fatal("a hook that floods stdout must not be drained to completion")
+	}
+	if len(stdout) > maxResponseBytes+1 {
+		t.Fatalf("the reader kept %d bytes, which is past the %d-byte cap", len(stdout), maxResponseBytes+1)
+	}
+
+	// The call above the transport reports the refusal as the size violation
+	// it is, rather than as whatever exit the broken pipe produced.
+	hook := &Hook{Path: script, Timeout: 20 * time.Second}
+	allowed := []Profile{{
+		ID: "claude-opus", Agent: types.AgentClaude, Provider: "anthropic-subscription",
+		Tuning: agentcfg.Profile{Model: "opus"},
+	}}
+	_, acquireErr := hook.Acquire(context.Background(), Request{
+		AssignmentID: "run-1-launch-1",
+		Owner:        Owner{Identity: "daemon", Generation: "gen-1"},
+		Routes:       []string{"claude-opus"},
+	}, allowed)
+	if acquireErr == nil {
+		t.Fatal("an oversized reply must never authorize a launch")
+	}
+	if !strings.Contains(acquireErr.Error(), "more than") {
+		t.Fatalf("error %q must name the size refusal", acquireErr)
+	}
+}

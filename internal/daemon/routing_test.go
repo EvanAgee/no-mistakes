@@ -115,6 +115,43 @@ func TestNewRoutedAgentFactory_HonorsOperatorPathAndArgumentOverrides(t *testing
 	}
 }
 
+// TestNewRoutedAgentFactory_FailsClosedWhenTheOptOutIsNotEffective proves the
+// routed path honors the same trust boundary the default gate agent does.
+//
+// disable_project_settings is a trusted, default-branch-only declaration that
+// the target repository's own AGENTS.md/CLAUDE.md must not steer the gate
+// agent. Passing that flag into the constructor is a request, not a guarantee:
+// an operator argument override that re-adds claude's `project` setting source
+// defeats it. Without this check routing would be the one path that launches
+// an unverified harness in the target checkout with those files loaded.
+func TestNewRoutedAgentFactory_FailsClosedWhenTheOptOutIsNotEffective(t *testing.T) {
+	var m RunManager
+	cfg := routableConfig()
+	cfg.DisableProjectSettings = true
+	cfg.AgentArgsOverride = map[string][]string{
+		string(types.AgentClaude): {"--setting-sources", "user,project"},
+	}
+
+	factory := m.newRoutedAgentFactory(cfg, t.TempDir(), runenv.Overlay{})
+	built, err := factory(cfg.Assignment.Profiles[0])
+	if err == nil {
+		_ = built.Close()
+		t.Fatal("an override that re-adds the project setting source must refuse the launch")
+	}
+	if !strings.Contains(err.Error(), "neutralize") {
+		t.Fatalf("error %q must name the neutralization refusal", err)
+	}
+
+	// The same opt-out with no defeating override still builds, so the check
+	// refuses only what it must.
+	cfg.AgentArgsOverride = nil
+	ok, err := factory(cfg.Assignment.Profiles[0])
+	if err != nil {
+		t.Fatalf("an effective opt-out must still build the adapter: %v", err)
+	}
+	t.Cleanup(func() { _ = ok.Close() })
+}
+
 // TestRoutingGeneration_IsStablePerIncarnationAndChangesOnRestart proves what
 // the controller needs to attribute assignments: one daemon incarnation
 // reports one generation for every run it owns, and a restart reports a

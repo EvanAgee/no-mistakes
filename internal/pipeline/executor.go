@@ -866,21 +866,29 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 	autoFixAttempts := state.autoFixAttempts
 	roundNum := state.roundNum
 
-	stepAgent := e.agent
-	if stepAgent != nil {
+	// wrapStepAgent is the step's whole harness, expressed once. It is applied
+	// to the executor's own agent below and handed to StepContext so a routed
+	// invocation can apply the identical stack to the adapter routing built:
+	// the gate phase boundary, lifecycle events and perf recording are
+	// properties of being a step invocation, not of which service serves it.
+	wrapStepAgent := func(inner agent.Agent) agent.Agent {
+		if inner == nil {
+			return nil
+		}
 		// Innermost: default-by-construction invocation deadline so a step
 		// that calls Agent.Run directly cannot hang the run.
-		stepAgent = &timeoutAgent{inner: stepAgent, timeout: AgentTimeout(e.config)}
-		stepAgent = &gateStepBoundaryAgent{inner: stepAgent, phase: stepName}
-		stepAgent = &lifecycleAgent{inner: stepAgent, onLifecycle: onAgentLifecycle}
-		stepAgent = &perfRecordingAgent{
-			inner:    stepAgent,
+		wrapped := agent.Agent(&timeoutAgent{inner: inner, timeout: AgentTimeout(e.config)})
+		wrapped = &gateStepBoundaryAgent{inner: wrapped, phase: stepName}
+		wrapped = &lifecycleAgent{inner: wrapped, onLifecycle: onAgentLifecycle}
+		return &perfRecordingAgent{
+			inner:    wrapped,
 			db:       e.db,
 			runID:    run.ID,
 			stepName: stepName,
 			round:    func() int { return roundNum + 1 },
 		}
 	}
+	stepAgent := wrapStepAgent(e.agent)
 	ciReady := run.CIReadyAt != nil
 	ciReadyNoCI := run.CIReadyNoCI
 	ciReadinessChanged := func(ready, declaredNoCI bool) {
@@ -911,6 +919,7 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 		WorkDir:          workDir,
 		GateDir:          e.paths.RepoDir(repo.ID),
 		Agent:            stepAgent,
+		WrapAgent:        wrapStepAgent,
 		Config:           e.config,
 		ForgeContext:     e.forge,
 		DB:               e.db,

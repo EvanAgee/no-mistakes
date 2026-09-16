@@ -73,6 +73,20 @@ func NewRouter(hook *Hook, profiles []Profile, owner, generation string) (*Route
 	}, nil
 }
 
+// OwnerGeneration is the caller-supplied identifier of this daemon
+// incarnation. A caller that mints assignment ids needs it, because the
+// controller's idempotency key is (assignment_id, owner.identity) and
+// deliberately excludes the owner generation: an id minted by a previous
+// incarnation is replayed as the SAME launch rather than admitted as a new
+// one, so an id that must be unique across a restart has to carry the
+// generation itself. Empty on a nil router, which is routing being off.
+func (r *Router) OwnerGeneration() string {
+	if r == nil {
+		return ""
+	}
+	return r.generation
+}
+
 // Assignment is one admitted invocation. Finish must be called for every
 // Assignment that Route returns, whatever happens to the invocation.
 type Assignment struct {

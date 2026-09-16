@@ -29,9 +29,16 @@ type RunRouting struct {
 	// recovered turn are each distinct attempts to the hook rather than one
 	// attempt acquired repeatedly.
 	seq atomic.Uint64
-	// runID prefixes every assignment id so two runs never collide in the
-	// hook's shared record.
-	runID string
+	// launchPrefix is what every assignment id of this run begins with. It
+	// carries both the run (so two runs never collide) and this daemon
+	// incarnation (so a run RESUMED after a restart never replays an id the
+	// previous incarnation already spent). The controller's idempotency key is
+	// (assignment_id, owner.identity) and excludes the owner generation on
+	// purpose, so a bare "<runID>-launch-<n>" restarted at n=1 would be
+	// answered `already-closed` and fail the recovered run on its first
+	// routed turn. Folding the generation in makes each incarnation's counter
+	// its own id space.
+	launchPrefix string
 }
 
 // NewRunRouting builds the run's routing, or nil when routing is off.
@@ -39,7 +46,11 @@ func NewRunRouting(router *routing.Router, runID string, newAgent func(routing.P
 	if router == nil || newAgent == nil {
 		return nil
 	}
-	return &RunRouting{router: router, newAgent: newAgent, runID: runID}
+	prefix := runID
+	if generation := router.OwnerGeneration(); generation != "" {
+		prefix = runID + "-" + generation
+	}
+	return &RunRouting{router: router, newAgent: newAgent, launchPrefix: prefix}
 }
 
 // routedInvocation is what acquireRoute hands back to the invocation seam.
@@ -88,9 +99,10 @@ func (sctx *StepContext) acquireRoute(ctx context.Context, opts *agent.RunOpts, 
 	// counted as work that already happened - if they shared an id.
 	//
 	// The shape mirrors the controller's own relaunch convention
-	// (<task>-relaunch-<generation>): the run identifies the work, and the
-	// monotonic counter identifies which launch attempt within it.
-	assignmentID := fmt.Sprintf("%s-launch-%d", r.runID, r.seq.Add(1))
+	// (<task>-relaunch-<generation>): the run and this daemon incarnation
+	// identify the work, and the monotonic counter identifies which launch
+	// attempt within it.
+	assignmentID := fmt.Sprintf("%s-launch-%d", r.launchPrefix, r.seq.Add(1))
 	assignment, selected, err := r.router.Route(ctx, assignmentID, opts.Purpose)
 	if err != nil {
 		switch {
@@ -117,7 +129,7 @@ func (sctx *StepContext) acquireRoute(ctx context.Context, opts *agent.RunOpts, 
 	}
 
 	invocation := &routedInvocation{assignment: assignment}
-	routedAgent, err := r.newAgent(assignment.Profile)
+	routedAgent, err := sctx.buildRoutedAgent(assignment.Profile)
 	if err != nil {
 		// The process never started, so the route consumed nothing. Report
 		// that distinctly: a controller counting in-flight work must release
@@ -147,6 +159,31 @@ func (sctx *StepContext) acquireRoute(ctx context.Context, opts *agent.RunOpts, 
 		r.finish(context.WithoutCancel(ctx), invocation, routing.OutcomeLaunchFailed)
 	}
 	return invocation, true, release, nil
+}
+
+// buildRoutedAgent constructs the adapter a selected profile names and dresses
+// it in the same harness the step's own agent wears.
+//
+// The harness is not decoration: gateStepBoundaryAgent is the only place the
+// gate phase-boundary preamble is prepended, so an unwrapped routed adapter
+// would receive the bare step prompt without the containment that stops a gate
+// agent from starting a second pipeline. The lifecycle and perf layers are the
+// run's only record that the launch happened at all. Routing decides WHICH
+// service serves a turn and nothing else about how that turn runs, so a routed
+// adapter must be wrapped exactly like the default one.
+func (sctx *StepContext) buildRoutedAgent(profile routing.Profile) (agent.Agent, error) {
+	built, err := sctx.Routing.newAgent(profile)
+	if err != nil {
+		return nil, err
+	}
+	if sctx.WrapAgent == nil {
+		return built, nil
+	}
+	wrapped := sctx.WrapAgent(built)
+	if wrapped == nil {
+		return built, nil
+	}
+	return wrapped, nil
 }
 
 // recordRouteOutcome reports the invocation's normalized result. It runs on

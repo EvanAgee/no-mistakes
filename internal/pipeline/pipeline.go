@@ -82,6 +82,13 @@ type StepContext struct {
 	// is the default and leaves every invocation exactly as it was before
 	// routing existed.
 	Routing *RunRouting
+	// WrapAgent applies this step's invocation harness - the gate phase
+	// boundary prompt, lifecycle events, perf recording and the backstop
+	// deadline - to a bare adapter. Agent above is already wrapped with it;
+	// routing applies it to the adapter a selected profile builds, so a routed
+	// turn keeps exactly the same containment and instrumentation as a default
+	// one. Nil in embeddings that build their own agent.
+	WrapAgent func(agent.Agent) agent.Agent
 	// Shared carries in-memory run-scoped results one step hands to a later
 	// step in the same run (e.g. the combined document+lint pass).
 	Shared             *RunShared

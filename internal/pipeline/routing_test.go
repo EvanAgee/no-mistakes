@@ -15,7 +15,9 @@ import (
 
 	"github.com/kunchenguid/no-mistakes/internal/agent"
 	"github.com/kunchenguid/no-mistakes/internal/config"
+	"github.com/kunchenguid/no-mistakes/internal/gateguidance"
 	"github.com/kunchenguid/no-mistakes/internal/routing"
+	"github.com/kunchenguid/no-mistakes/internal/types"
 )
 
 // These tests pin the invocation seam: every native invocation acquires a
@@ -59,6 +61,14 @@ func (f *fakeHookTransport) finishes() []routing.Request {
 func testRouting(t *testing.T, transport *fakeHookTransport, profiles []routing.Profile,
 	newAgent func(routing.Profile) (agent.Agent, error)) *RunRouting {
 	t.Helper()
+	return testRoutingForGeneration(t, transport, profiles, newAgent, "gen-1")
+}
+
+// testRoutingForGeneration is testRouting with an explicit daemon incarnation,
+// so a test can build the same run's routing twice as two incarnations would.
+func testRoutingForGeneration(t *testing.T, transport *fakeHookTransport, profiles []routing.Profile,
+	newAgent func(routing.Profile) (agent.Agent, error), generation string) *RunRouting {
+	t.Helper()
 
 	hook := routing.NewTestHook(func(_ context.Context, verb routing.Verb, stdin []byte) ([]byte, error) {
 		var req routing.Request
@@ -82,7 +92,7 @@ func testRouting(t *testing.T, transport *fakeHookTransport, profiles []routing.
 		return payload, nil
 	})
 
-	router, err := routing.NewRouter(hook, profiles, "daemon", "gen-1")
+	router, err := routing.NewRouter(hook, profiles, "daemon", generation)
 	if err != nil {
 		t.Fatalf("new router: %v", err)
 	}
@@ -770,12 +780,127 @@ func TestRunAgent_EveryLaunchUsesItsOwnAssignmentID(t *testing.T) {
 			t.Fatalf("assignment id %q was used for two launches", id)
 		}
 		seen[id] = true
-		if !strings.HasPrefix(id, "run-1-launch-") {
-			t.Fatalf("assignment id %q must name the run and the launch attempt", id)
+		if !strings.HasPrefix(id, "run-1-gen-1-launch-") {
+			t.Fatalf("assignment id %q must name the run, the incarnation and the launch attempt", id)
 		}
 	}
 	if len(seen) != launches {
 		t.Fatalf("want %d distinct assignment ids, got %d", launches, len(seen))
+	}
+}
+
+// TestRunAgent_RoutedAdapterKeepsTheStepInvocationHarness proves a routed turn
+// is dressed in the same wrappers the step's own agent wears.
+//
+// The harness is containment, not decoration: the gate phase-boundary preamble
+// is prepended by one wrapper and nowhere else, and it is what stops a gate
+// agent from starting a second pipeline. A routed adapter launched bare would
+// receive the step prompt with that block missing, and would also produce no
+// lifecycle or performance record of the launch at all.
+func TestRunAgent_RoutedAdapterKeepsTheStepInvocationHarness(t *testing.T) {
+	transport := &fakeHookTransport{reply: selectByID(routingPiGrokProfile().ID)}
+	routed := &recordingAgent{profile: routingPiGrokProfile()}
+	run := testRouting(t, transport, []routing.Profile{routingPiGrokProfile()},
+		func(routing.Profile) (agent.Agent, error) { return routed, nil })
+
+	wrapped := 0
+	sctx := &StepContext{
+		Ctx:     context.Background(),
+		Agent:   &hangingAgent{name: "configured"},
+		Routing: run,
+		WrapAgent: func(inner agent.Agent) agent.Agent {
+			wrapped++
+			return &gateStepBoundaryAgent{inner: inner, phase: types.StepReview}
+		},
+	}
+	if _, err := sctx.RunAgent(agent.RunOpts{Prompt: "repair the finding", Purpose: "review-fix"}); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	if wrapped != 1 {
+		t.Fatalf("the step harness was applied %d times, want exactly once", wrapped)
+	}
+	routed.mu.Lock()
+	prompts := append([]string(nil), routed.prompts...)
+	routed.mu.Unlock()
+	if len(prompts) != 1 {
+		t.Fatalf("routed adapter saw %d prompts, want 1", len(prompts))
+	}
+	boundary := gateguidance.PromptBoundary("review")
+	if !strings.HasPrefix(prompts[0], boundary) {
+		t.Fatalf("routed adapter did not receive the gate phase boundary; prompt was:\n%s", prompts[0])
+	}
+	if !strings.Contains(prompts[0], "repair the finding") {
+		t.Fatalf("routed adapter lost the step's own prompt; prompt was:\n%s", prompts[0])
+	}
+}
+
+// TestRunAgent_UnwrappedStepContextStillRoutes keeps the harness optional, so
+// an embedding that builds its own agent and supplies no WrapAgent still gets a
+// routed launch rather than an error or a silent default-agent launch.
+func TestRunAgent_UnwrappedStepContextStillRoutes(t *testing.T) {
+	transport := &fakeHookTransport{reply: selectByID(routingPiGrokProfile().ID)}
+	routed := &recordingAgent{profile: routingPiGrokProfile()}
+	configured := &hangingAgent{name: "configured"}
+	run := testRouting(t, transport, []routing.Profile{routingPiGrokProfile()},
+		func(routing.Profile) (agent.Agent, error) { return routed, nil })
+
+	sctx := &StepContext{Ctx: context.Background(), Agent: configured, Routing: run}
+	if _, err := sctx.RunAgent(agent.RunOpts{Prompt: "repair", Purpose: "review-fix"}); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	routed.mu.Lock()
+	served := len(routed.prompts)
+	routed.mu.Unlock()
+	if served != 1 {
+		t.Fatalf("routed adapter served %d turns, want 1", served)
+	}
+}
+
+// TestRunAgent_AssignmentIDsDoNotRepeatAcrossADaemonRestart is the recovery
+// case. The controller's idempotency key is (assignment_id, owner.identity)
+// and deliberately excludes the owner generation, so a second incarnation of
+// the same daemon that restarted its per-process counter would re-acquire the
+// very ids the first one already finished. The controller would replay each as
+// the SAME launch and answer already-closed, which fails the recovered run on
+// its first routed turn. Ids must therefore be unique across incarnations of
+// one run, not only within one process.
+func TestRunAgent_AssignmentIDsDoNotRepeatAcrossADaemonRestart(t *testing.T) {
+	acquiredIDs := func(t *testing.T, generation string) []string {
+		t.Helper()
+		transport := &fakeHookTransport{reply: selectByID(routingPiGrokProfile().ID)}
+		run := testRoutingForGeneration(t, transport, []routing.Profile{routingPiGrokProfile()},
+			func(p routing.Profile) (agent.Agent, error) { return &recordingAgent{profile: p}, nil }, generation)
+		sctx := &StepContext{Ctx: context.Background(), Agent: &hangingAgent{name: "configured"}, Routing: run}
+		for i := range 3 {
+			if _, err := sctx.RunAgent(agent.RunOpts{
+				Prompt: fmt.Sprintf("fix round %d", i+1), Purpose: "review-fix",
+			}); err != nil {
+				t.Fatalf("launch %d: %v", i+1, err)
+			}
+		}
+		ids := []string{}
+		for _, call := range transport.seen() {
+			if call.verb == routing.VerbAcquire {
+				ids = append(ids, call.req.AssignmentID)
+			}
+		}
+		return ids
+	}
+
+	before := acquiredIDs(t, "pid-1-started-1")
+	after := acquiredIDs(t, "pid-2-started-2")
+	if len(before) == 0 || len(before) != len(after) {
+		t.Fatalf("want the same number of launches in both incarnations, got %d and %d", len(before), len(after))
+	}
+	spent := map[string]bool{}
+	for _, id := range before {
+		spent[id] = true
+	}
+	for _, id := range after {
+		if spent[id] {
+			t.Fatalf("resumed run re-acquired assignment id %q, which the previous incarnation already finished", id)
+		}
 	}
 }
 
