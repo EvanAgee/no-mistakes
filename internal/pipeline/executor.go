@@ -436,6 +436,16 @@ func (e *Executor) Resume(ctx context.Context, run *db.Run, repo *db.Repo, workD
 		e.emitStepEventWithFindingsAndError(ipc.EventStepCompleted, run, repo, gate.step.Name(), string(types.StepStatusCompleted), "", "", &duration)
 		return e.executeRecoveredRemainder(ctx, run, repo, workDir, logDir, gate.index+1, false)
 	}
+	reconcileLifecycle := func(event agent.LifecycleEvent) {
+		text := event.Message
+		if text == "" {
+			text = fmt.Sprintf("%s %s", event.Agent, event.Phase)
+		}
+		if dbErr := e.db.TouchStepActivity(gate.stepResult.ID, text); dbErr != nil {
+			slog.Warn("failed to touch step activity in db", "step", gate.step.Name(), "error", dbErr)
+		}
+	}
+	reconcileHarness := e.stepAgentHarness(run.ID, gate.step.Name(), reconcileLifecycle, func() int { return 1 })
 	reconcileCtx := &StepContext{
 		Ctx:          ctx,
 		Run:          run,
@@ -447,6 +457,7 @@ func (e *Executor) Resume(ctx context.Context, run *db.Run, repo *db.Repo, workD
 		DB:           e.db,
 		StepResultID: gate.stepResult.ID,
 		Agent:        e.agent,
+		WrapAgent:    reconcileHarness,
 		Sessions:     e.sessions,
 		Routing:      e.routing,
 		Shared:       e.shared,
@@ -750,6 +761,30 @@ func (e *Executor) autoFixLimit(stepName types.StepName) int {
 	return e.config.AutoFixLimit(stepName)
 }
 
+// stepAgentHarness is the invocation stack every agent a step launches must
+// wear, whichever service serves it: a backstop deadline, the gate phase
+// boundary that stops a gate agent starting a second pipeline, lifecycle
+// events, and the run's perf record. It lives here rather than inline so every
+// StepContext that carries Routing can hand routing the identical stack; a
+// context that carries Routing without one is refused (see buildRoutedAgent).
+func (e *Executor) stepAgentHarness(runID string, stepName types.StepName, onLifecycle func(agent.LifecycleEvent), round func() int) func(agent.Agent) agent.Agent {
+	return func(inner agent.Agent) agent.Agent {
+		if inner == nil {
+			return nil
+		}
+		wrapped := agent.Agent(&timeoutAgent{inner: inner, timeout: AgentTimeout(e.config)})
+		wrapped = &gateStepBoundaryAgent{inner: wrapped, phase: stepName}
+		wrapped = &lifecycleAgent{inner: wrapped, onLifecycle: onLifecycle}
+		return &perfRecordingAgent{
+			inner:    wrapped,
+			db:       e.db,
+			runID:    runID,
+			stepName: stepName,
+			round:    round,
+		}
+	}
+}
+
 // executeStep runs a single step with approval coordination.
 // Returns whether to skip the remainder, an optional earlier restart step,
 // and any execution error.
@@ -871,23 +906,7 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 	// invocation can apply the identical stack to the adapter routing built:
 	// the gate phase boundary, lifecycle events and perf recording are
 	// properties of being a step invocation, not of which service serves it.
-	wrapStepAgent := func(inner agent.Agent) agent.Agent {
-		if inner == nil {
-			return nil
-		}
-		// Innermost: default-by-construction invocation deadline so a step
-		// that calls Agent.Run directly cannot hang the run.
-		wrapped := agent.Agent(&timeoutAgent{inner: inner, timeout: AgentTimeout(e.config)})
-		wrapped = &gateStepBoundaryAgent{inner: wrapped, phase: stepName}
-		wrapped = &lifecycleAgent{inner: wrapped, onLifecycle: onAgentLifecycle}
-		return &perfRecordingAgent{
-			inner:    wrapped,
-			db:       e.db,
-			runID:    run.ID,
-			stepName: stepName,
-			round:    func() int { return roundNum + 1 },
-		}
-	}
+	wrapStepAgent := e.stepAgentHarness(run.ID, stepName, onAgentLifecycle, func() int { return roundNum + 1 })
 	stepAgent := wrapStepAgent(e.agent)
 	ciReady := run.CIReadyAt != nil
 	ciReadyNoCI := run.CIReadyNoCI

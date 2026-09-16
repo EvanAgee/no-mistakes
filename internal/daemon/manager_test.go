@@ -12,11 +12,13 @@ import (
 	"time"
 
 	"github.com/kunchenguid/no-mistakes/internal/agent"
+	"github.com/kunchenguid/no-mistakes/internal/agentcfg"
 	"github.com/kunchenguid/no-mistakes/internal/custody"
 	"github.com/kunchenguid/no-mistakes/internal/db"
 	"github.com/kunchenguid/no-mistakes/internal/git"
 	"github.com/kunchenguid/no-mistakes/internal/ipc"
 	"github.com/kunchenguid/no-mistakes/internal/pipeline"
+	"github.com/kunchenguid/no-mistakes/internal/routing"
 	"github.com/kunchenguid/no-mistakes/internal/scm"
 	"github.com/kunchenguid/no-mistakes/internal/telemetry"
 	"github.com/kunchenguid/no-mistakes/internal/types"
@@ -46,8 +48,84 @@ func TestValidateRecoveredSessionProviders_RejectsUnavailableFixerProvider(t *te
 		t.Fatal(err)
 	}
 	defer claude.Close()
-	if err := validateRecoveredSessionProviders(database, run.ID, claude); err == nil || !strings.Contains(err.Error(), `session provider "codex" is no longer configured`) {
+	if err := validateRecoveredSessionProviders(database, run.ID, claude, nil, nil); err == nil || !strings.Contains(err.Error(), `session provider "codex" is no longer configured`) {
 		t.Fatalf("validate recovered fixer provider error = %v", err)
+	}
+}
+
+func recoveredSessionTestRun(t *testing.T, provider string) (*db.DB, string) {
+	t.Helper()
+	database, err := db.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { database.Close() })
+	repo, err := database.InsertRepo("/tmp/repo", "https://example.com/repo.git", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := database.InsertRun(repo.ID, "feature", "head", "base")
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile := routing.Profile{
+		ID:       "codex-sol",
+		Agent:    types.AgentCodex,
+		Provider: "openai-subscription",
+		Tuning:   agentcfg.Profile{Model: "gpt-5.6-sol", Effort: agentcfg.EffortHigh},
+	}
+	if err := database.UpsertRunAgentSession(run.ID, string(pipeline.SessionRoleFixer), provider, "fixer-session", routing.ProfileKey(profile)); err != nil {
+		t.Fatal(err)
+	}
+	return database, run.ID
+}
+
+func approvedRoutingProfiles() ([]routing.Profile, func(routing.Profile) (agent.Agent, error)) {
+	profiles := []routing.Profile{{
+		ID:       "codex-sol",
+		Agent:    types.AgentCodex,
+		Provider: "openai-subscription",
+		Tuning:   agentcfg.Profile{Model: "gpt-5.6-sol", Effort: agentcfg.EffortHigh},
+	}}
+	build := func(profile routing.Profile) (agent.Agent, error) {
+		return agent.New(profile.Agent, string(profile.Agent), nil)
+	}
+	return profiles, build
+}
+
+// TestValidateRecoveredSessionProviders_AcceptsRoutedFixerProvider proves
+// routing does not strand a parked run. A fixer session minted by an approved
+// routed profile is resumable, so a run whose DEFAULT agent is a different
+// adapter must still recover.
+func TestValidateRecoveredSessionProviders_AcceptsRoutedFixerProvider(t *testing.T) {
+	database, runID := recoveredSessionTestRun(t, "codex")
+	claude, err := agent.New(types.AgentClaude, "claude", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer claude.Close()
+
+	profiles, build := approvedRoutingProfiles()
+	if err := validateRecoveredSessionProviders(database, runID, claude, profiles, build); err != nil {
+		t.Fatalf("a session minted by an approved routed profile must recover, got %v", err)
+	}
+}
+
+// TestValidateRecoveredSessionProviders_RefusesProviderNoProfileServes proves
+// the gate is still real under routing: a provider that neither the default
+// agent nor any approved profile recognizes is refused exactly as before.
+func TestValidateRecoveredSessionProviders_RefusesProviderNoProfileServes(t *testing.T) {
+	database, runID := recoveredSessionTestRun(t, "gemini")
+	claude, err := agent.New(types.AgentClaude, "claude", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer claude.Close()
+
+	profiles, build := approvedRoutingProfiles()
+	err = validateRecoveredSessionProviders(database, runID, claude, profiles, build)
+	if err == nil || !strings.Contains(err.Error(), `session provider "gemini" is no longer configured`) {
+		t.Fatalf("an unconfigured provider must still be refused, got %v", err)
 	}
 }
 

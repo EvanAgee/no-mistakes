@@ -6,11 +6,16 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/kunchenguid/no-mistakes/internal/agent"
 	"github.com/kunchenguid/no-mistakes/internal/config"
+	"github.com/kunchenguid/no-mistakes/internal/gateguidance"
+	"github.com/kunchenguid/no-mistakes/internal/routing"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
 
@@ -453,5 +458,107 @@ func TestExecutor_GateRecheckStopsAfterApprovalCancelAndShutdown(t *testing.T) {
 				t.Fatalf("gate watcher leaked after %s: calls advanced from %d to %d", tt.name, settled, got)
 			}
 		})
+	}
+}
+
+// routingReconcilingStep reconciles a recovered gate by asking an agent one
+// question, which is the natural shape for "is this stale gate still real".
+type routingReconcilingStep struct {
+	name types.StepName
+	mu   sync.Mutex
+	err  error
+}
+
+func (s *routingReconcilingStep) Name() types.StepName { return s.name }
+
+func (s *routingReconcilingStep) Execute(*StepContext) (*StepOutcome, error) {
+	return &StepOutcome{NeedsApproval: true}, nil
+}
+
+func (s *routingReconcilingStep) ReconcileApprovalGate(sctx *StepContext) (bool, error) {
+	_, err := sctx.RunAgent(agent.RunOpts{Prompt: "is this gate still real", Purpose: "review-fix"})
+	s.mu.Lock()
+	s.err = err
+	s.mu.Unlock()
+	return true, nil
+}
+
+func (s *routingReconcilingStep) agentErr() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.err
+}
+
+// TestExecutor_RecoveredGateReconciliationWrapsARoutedAdapter proves the
+// recovered-gate path cannot launch a routed adapter bare. That StepContext
+// carries Routing, so without a harness the routed adapter would receive the
+// raw step prompt with no gate phase boundary, no lifecycle events, no perf
+// record and no backstop deadline - the one containment that stops a gate
+// agent from starting a second pipeline.
+func TestExecutor_RecoveredGateReconciliationWrapsARoutedAdapter(t *testing.T) {
+	database, p, run, repo := setupTest(t)
+	if err := database.UpdateRunStatus(run.ID, types.RunRunning); err != nil {
+		t.Fatal(err)
+	}
+	stepResult, err := database.InsertStepResult(run.ID, types.StepCI)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.StartStep(stepResult.ID); err != nil {
+		t.Fatal(err)
+	}
+	findings := `{"findings":[{"id":"ci-1","severity":"warning","description":"waiting","action":"ask-user"}],"summary":"waiting"}`
+	if err := database.SetStepFindings(stepResult.ID, findings); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.InsertStepRound(stepResult.ID, 1, "initial", &findings, nil, 10); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.UpdateStepStatusWithDuration(stepResult.ID, types.StepStatusAwaitingApproval, 10); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.SetRunAwaitingAgent(run.ID); err != nil {
+		t.Fatal(err)
+	}
+	run, err = database.GetRun(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	profile := routingPiGrokProfile()
+	hookPath := filepath.Join(t.TempDir(), "assignment-hook")
+	script := "#!/bin/sh\ncat >/dev/null\nif [ \"$1\" = finish ]; then\n  printf '{\"result\":\"closed\"}'\nelse\n  printf '{\"result\":\"selected\",\"route_id\":\"%s\",\"reason\":\"test\"}' " + profile.ID + "\nfi\n"
+	if err := os.WriteFile(hookPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &config.Config{Assignment: config.Assignment{
+		HookPath: hookPath,
+		Profiles: []routing.Profile{profile},
+	}}
+	routed := &recordingAgent{profile: profile}
+	step := &routingReconcilingStep{name: types.StepCI}
+	exec := NewExecutor(database, p, cfg, &hangingAgent{name: "configured"}, []Step{step}, nil)
+	exec.SetRouting(func(routing.Profile) (agent.Agent, error) { return routed, nil }, "owner-1", "gen-1")
+
+	if err := exec.Resume(context.Background(), run, repo, t.TempDir()); err != nil {
+		t.Fatalf("Resume() error = %v", err)
+	}
+	if err := step.agentErr(); err != nil {
+		t.Fatalf("the reconciler's routed turn failed: %v", err)
+	}
+
+	routed.mu.Lock()
+	prompts := append([]string(nil), routed.prompts...)
+	routed.mu.Unlock()
+	if len(prompts) != 1 {
+		t.Fatalf("routed adapter served %d turns, want 1", len(prompts))
+	}
+	boundary := gateguidance.PromptBoundary(string(types.StepCI))
+	if !strings.HasPrefix(prompts[0], boundary) {
+		t.Fatalf("the recovered path launched a routed adapter without the gate phase boundary; prompt was:\n%s", prompts[0])
+	}
+	if !strings.Contains(prompts[0], "is this gate still real") {
+		t.Fatalf("the routed adapter lost the reconciler's own prompt; prompt was:\n%s", prompts[0])
 	}
 }
