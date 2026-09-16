@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/kunchenguid/no-mistakes/internal/agent"
@@ -1007,4 +1008,170 @@ func TestRoutedSessions_ResumeAndFreshFallbackEachAcquireTheirOwnAssignment(t *t
 			t.Fatalf("finish %d outcome = %q, want %q", i, req.Outcome, want[i])
 		}
 	}
+}
+
+// nonResumingAgent is a configured adapter with no session support at all,
+// like opencode, copilot, rovodev and acpx: it does not implement
+// agent.SessionResumer, so agent.SupportsSessionResume is false for it.
+type nonResumingAgent struct {
+	name string
+	mu   sync.Mutex
+	runs int
+}
+
+func (a *nonResumingAgent) Name() string { return a.name }
+
+func (a *nonResumingAgent) Close() error { return nil }
+
+func (a *nonResumingAgent) Run(_ context.Context, opts agent.RunOpts) (*agent.Result, error) {
+	a.mu.Lock()
+	a.runs++
+	a.mu.Unlock()
+	return &agent.Result{Text: "ok"}, nil
+}
+
+// TestRoutedSessions_ResumingRoutedAdapterReusesDespiteNonResumingConfiguredAgent
+// proves the session path is decided by the adapter that ACTUALLY launches,
+// not by the run's configured agent.
+//
+// A run configured with a non-resuming adapter (opencode and friends) can be
+// routed to claude, codex or pi, all of which resume. Asking the configured
+// agent made every routed fixer turn of such a run permanently cold: the cold
+// branch passes a nil prepare, so no session reference is ever set and no
+// session id is ever persisted, for the whole life of the run.
+func TestRoutedSessions_ResumingRoutedAdapterReusesDespiteNonResumingConfiguredAgent(t *testing.T) {
+	d, run := sessionTestDB(t)
+	profile := routingPiGrokProfile()
+	counter := newMintCounter()
+
+	// The configured agent cannot resume; the routed one can.
+	configured := &nonResumingAgent{name: "opencode"}
+	if agent.SupportsSessionResume(configured) {
+		t.Fatal("the configured agent fixture must not support session resume")
+	}
+	routedSvc := newProfileAgent(profile, counter)
+
+	transport := &fakeHookTransport{reply: selectByID(profile.ID)}
+	routed := testRouting(t, transport, []routing.Profile{profile},
+		func(routing.Profile) (agent.Agent, error) { return routedSvc, nil })
+
+	sctx := &StepContext{
+		Ctx:       context.Background(),
+		Agent:     configured,
+		Sessions:  NewRunSessions(d, run.ID, configured, true),
+		Routing:   routed,
+		WrapAgent: testStepHarness,
+	}
+
+	minted, err := sctx.RunAgentSessionContext(context.Background(), SessionRoleFixer,
+		agent.RunOpts{Prompt: "fix round 1", Purpose: "review-fix"})
+	if err != nil {
+		t.Fatalf("first turn: %v", err)
+	}
+	if minted.SessionID == "" {
+		t.Fatal("the routed adapter resumes, so the first turn must mint a session id")
+	}
+
+	second, err := sctx.RunAgentSessionContext(context.Background(), SessionRoleFixer,
+		agent.RunOpts{Prompt: "fix round 2", Purpose: "review-fix"})
+	if err != nil {
+		t.Fatalf("second turn: %v", err)
+	}
+	if !second.Resumed || second.SessionID != minted.SessionID {
+		t.Fatalf("second turn must resume %q, got resumed=%v id=%q",
+			minted.SessionID, second.Resumed, second.SessionID)
+	}
+
+	// The configured agent must never have run: routing serves every turn.
+	configured.mu.Lock()
+	configuredRuns := configured.runs
+	configured.mu.Unlock()
+	if configuredRuns != 0 {
+		t.Fatalf("the configured agent ran %d times; routing must serve every turn", configuredRuns)
+	}
+
+	// The session is persisted under the profile that actually minted it.
+	rows, err := d.GetRunAgentSessions(run.ID)
+	if err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("persisted rows = %d, want 1", len(rows))
+	}
+	if rows[0].ProfileKey != routing.ProfileKey(profile) {
+		t.Fatalf("row profile key = %q, want the routed profile's key", rows[0].ProfileKey)
+	}
+	if rows[0].SessionID != minted.SessionID {
+		t.Fatalf("row session id = %q, want %q", rows[0].SessionID, minted.SessionID)
+	}
+}
+
+// TestRoutedSessions_NonResumingRoutedAdapterIsNeverAskedToResume proves the
+// opposite direction: a resuming configured agent must not cause a routed
+// adapter that cannot resume to be handed a session reference, and nothing is
+// persisted for a turn whose adapter cannot mint a resumable identity.
+func TestRoutedSessions_NonResumingRoutedAdapterIsNeverAskedToResume(t *testing.T) {
+	d, run := sessionTestDB(t)
+	profile := routingPiGrokProfile()
+
+	// The configured agent resumes; the routed one does not.
+	configured := newFakeSessionAgent()
+	routedSvc := &recordingSessionOpts{inner: &nonResumingAgent{name: "pi"}}
+
+	transport := &fakeHookTransport{reply: selectByID(profile.ID)}
+	routed := testRouting(t, transport, []routing.Profile{profile},
+		func(routing.Profile) (agent.Agent, error) { return routedSvc, nil })
+
+	sctx := &StepContext{
+		Ctx:       context.Background(),
+		Agent:     configured,
+		Sessions:  NewRunSessions(d, run.ID, configured, true),
+		Routing:   routed,
+		WrapAgent: testStepHarness,
+	}
+
+	for round := 1; round <= 2; round++ {
+		if _, err := sctx.RunAgentSessionContext(context.Background(), SessionRoleFixer,
+			agent.RunOpts{Prompt: fmt.Sprintf("fix round %d", round), Purpose: "review-fix"}); err != nil {
+			t.Fatalf("round %d: %v", round, err)
+		}
+	}
+
+	routedSvc.mu.Lock()
+	sessions := append([]*agent.SessionRef(nil), routedSvc.sessions...)
+	routedSvc.mu.Unlock()
+	if len(sessions) != 2 {
+		t.Fatalf("routed adapter served %d turns, want 2", len(sessions))
+	}
+	for i, ref := range sessions {
+		if ref != nil {
+			t.Fatalf("turn %d handed a session reference %+v to an adapter that cannot resume", i+1, ref)
+		}
+	}
+
+	rows, err := d.GetRunAgentSessions(run.ID)
+	if err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("persisted %d rows for an adapter that cannot resume, want 0: %+v", len(rows), rows)
+	}
+}
+
+// recordingSessionOpts records the session reference each launch was handed.
+type recordingSessionOpts struct {
+	inner    agent.Agent
+	mu       sync.Mutex
+	sessions []*agent.SessionRef
+}
+
+func (a *recordingSessionOpts) Name() string { return a.inner.Name() }
+
+func (a *recordingSessionOpts) Close() error { return a.inner.Close() }
+
+func (a *recordingSessionOpts) Run(ctx context.Context, opts agent.RunOpts) (*agent.Result, error) {
+	a.mu.Lock()
+	a.sessions = append(a.sessions, opts.Session)
+	a.mu.Unlock()
+	return a.inner.Run(ctx, opts)
 }

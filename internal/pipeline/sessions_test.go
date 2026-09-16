@@ -404,10 +404,6 @@ type fixedAgentLauncher struct {
 
 func (l *fixedAgentLauncher) Name() string { return l.a.Name() }
 
-func (l *fixedAgentLauncher) SupportsSessionResume() bool {
-	return agent.SupportsSessionResume(l.a)
-}
-
 func (l *fixedAgentLauncher) Run(ctx context.Context, opts agent.RunOpts, prepare func(agent.Agent, string, *agent.RunOpts)) (agent.Agent, *agent.Result, error) {
 	if prepare != nil {
 		prepare(l.a, l.profileKey, &opts)

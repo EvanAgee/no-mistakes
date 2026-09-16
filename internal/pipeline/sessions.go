@@ -124,13 +124,17 @@ func NewRunSessions(database *db.DB, runID string, sessionAgent agent.Agent, ena
 // launch again, so it acquires its own assignment and reports its own outcome
 // instead of being folded into the first attempt's.
 //
+// Whether a turn uses a session at all is decided INSIDE the attempt, against
+// the adapter that actually launched, never against the run's configured
+// agent. Under routing those differ: a run configured with a non-resuming
+// adapter can be routed to a resuming one, and gating the session path on the
+// configured agent left such a run permanently cold. An adapter that cannot
+// resume simply runs the turn with no session reference and persists nothing.
+//
 // logf (optional) receives operator-visible notes about session reuse and
 // fallbacks.
 func (rs *RunSessions) Run(ctx context.Context, launch agentLauncher, role SessionRole, opts agent.RunOpts, logf func(string)) (*agent.Result, error) {
-	if rs == nil || !rs.enabled || !launch.SupportsSessionResume() {
-		if rs != nil && rs.enabled && logf != nil {
-			logf(fmt.Sprintf("agent %s does not support session resume; running cold", launch.Name()))
-		}
+	if rs == nil || !rs.enabled {
 		_, result, err := launch.Run(ctx, opts, nil)
 		return result, err
 	}
@@ -138,15 +142,31 @@ func (rs *RunSessions) Run(ctx context.Context, launch agentLauncher, role Sessi
 	// resumeAttempted records whether this attempt was actually handed a
 	// stored session id. Only then is a failure worth retrying in a fresh
 	// session; a cold attempt that failed has nothing to fall back from.
-	var resumeAttempted bool
+	//
+	// resumable records whether the adapter that actually launched can resume
+	// at all, which is answered inside prepare rather than before the call:
+	// under routing the serving adapter is chosen when the attempt acquires
+	// its route, and a run configured with a non-resuming agent can be routed
+	// to a resuming one.
+	var resumeAttempted, canResume bool
 	var launchedKey string
 	invoked, result, err := launch.Run(ctx, opts, func(a agent.Agent, profileKey string, o *agent.RunOpts) {
+		if !agent.SupportsSessionResume(a) {
+			if logf != nil {
+				logf(fmt.Sprintf("agent %s does not support session resume; running cold", a.Name()))
+			}
+			return
+		}
+		canResume = true
 		launchedKey = profileKey
 		stored := rs.resumable(role, profileKey, logf)
 		resumeAttempted = stored.ID != ""
 		o.Session = &stored
 	})
 	if err == nil {
+		if !canResume {
+			return result, nil
+		}
 		rs.remember(role, invoked, result.SessionID, sessionProvider(invoked, result), launchedKey)
 		return result, nil
 	}
@@ -171,12 +191,21 @@ func (rs *RunSessions) Run(ctx context.Context, launch agentLauncher, role Sessi
 		})
 	}
 	var freshKey string
+	var freshCanResume bool
 	invoked, result, err = launch.Run(ctx, opts, func(a agent.Agent, profileKey string, o *agent.RunOpts) {
+		if !agent.SupportsSessionResume(a) {
+			o.Session = nil
+			return
+		}
+		freshCanResume = true
 		freshKey = profileKey
 		o.Session = &agent.SessionRef{}
 	})
 	if err != nil {
 		return nil, err
+	}
+	if !freshCanResume {
+		return result, nil
 	}
 	rs.remember(role, invoked, result.SessionID, sessionProvider(invoked, result), freshKey)
 	return result, nil

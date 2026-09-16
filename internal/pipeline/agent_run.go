@@ -104,17 +104,23 @@ func (sctx *StepContext) agentLauncher(configured agent.Agent) agentLauncher {
 // served it, so a stored session identity is attributed to whatever really
 // ran rather than to whatever was configured.
 type agentLauncher interface {
-	// Name and SupportsSessionResume answer for the step's configured agent,
-	// which is what runs when routing is off and what a caller inspecting
-	// capabilities is asking about. A routed attempt substitutes its own
-	// adapter inside Run, after the capability question has already been
-	// answered for the turn's prompt.
+	// Name answers for the step's configured agent, which is what runs when
+	// routing is off and what an operator reading a log line about this turn
+	// is asking about.
+	//
+	// There is deliberately no SupportsSessionResume here. Whether the
+	// adapter that serves an attempt can resume a session is only knowable
+	// once that attempt's route is acquired, and under routing the configured
+	// agent is not it: a run configured with a non-resuming adapter can be
+	// routed to a resuming one and vice versa. Asking the launcher would
+	// answer for the wrong process, so the question belongs inside prepare,
+	// which runs with the real adapter in hand.
 	Name() string
-	SupportsSessionResume() bool
 	// Run performs one attempt. prepare (optional) receives the adapter about
 	// to launch and its profile key, and may adjust the options - that is
 	// where a session reference is chosen, because which profile serves this
-	// attempt is what decides whether a stored session may be resumed at all.
+	// attempt is what decides both whether that adapter can resume at all and
+	// whether a stored session may be resumed by it.
 	Run(ctx context.Context, opts agent.RunOpts, prepare func(agent.Agent, string, *agent.RunOpts)) (agent.Agent, *agent.Result, error)
 }
 
@@ -132,13 +138,6 @@ func (l *routedLauncher) Name() string {
 		return ""
 	}
 	return l.configured.Name()
-}
-
-func (l *routedLauncher) SupportsSessionResume() bool {
-	if l == nil {
-		return false
-	}
-	return agent.SupportsSessionResume(l.configured)
 }
 
 // Run performs exactly one attempt under exactly one assignment.
