@@ -352,6 +352,109 @@ func TestRouter_DuplicateAcquisitionAndFinishHaveExplicitOutcomes(t *testing.T) 
 	}
 }
 
+// TestRouter_FinishThatNeverReachedTheHookStaysOpenForRetry proves a lost
+// report is recoverable rather than silently counted as delivered.
+//
+// The controller learns a route is free only from finish. If the router spent
+// the id locally before the hook accepted the report, a momentarily unavailable
+// hook would leave that route marked in flight forever, biasing every later
+// acquire for every caller on this machine, and no path could ever deliver the
+// missed report: a second finish would find the id already spent and return a
+// local success. The finish verb is idempotent by contract, so retrying can
+// only turn a lost report into a delivered one.
+func TestRouter_FinishThatNeverReachedTheHookStaysOpenForRetry(t *testing.T) {
+	var refuse bool
+	rh := &recordingHook{
+		fail: func(verb Verb, _ Request) error {
+			if verb == VerbFinish && refuse {
+				return errors.New("hook unavailable")
+			}
+			return nil
+		},
+	}
+	router := testRouter(t, rh, piGrokProfile())
+
+	assignment, _, err := router.Route(context.Background(), "run-1-launch-1", "review-fix")
+	if err != nil {
+		t.Fatalf("route: %v", err)
+	}
+
+	refuse = true
+	if err := router.Finish(context.Background(), assignment.ID, OutcomeSuccess); err == nil {
+		t.Fatal("a finish the hook refused must be reported to the caller")
+	}
+
+	// The lost report must still be owed, not recorded as paid.
+	refuse = false
+	before := len(rh.seen())
+	if err := router.Finish(context.Background(), assignment.ID, OutcomeSuccess); err != nil {
+		t.Fatalf("retrying a lost finish: %v", err)
+	}
+	delivered := rh.seen()[before:]
+	if len(delivered) != 1 || delivered[0].verb != VerbFinish {
+		t.Fatalf("the retry must reach the hook, got %d calls", len(delivered))
+	}
+	if delivered[0].req.AssignmentID != assignment.ID {
+		t.Fatalf("the retry reported %q, want the original assignment %q", delivered[0].req.AssignmentID, assignment.ID)
+	}
+	// The identity is still the one Route recorded, not a caller-supplied one.
+	if delivered[0].req.Profile == nil || delivered[0].req.Profile.Adapter != string(piGrokProfile().Agent) {
+		t.Fatalf("the retry must carry the acquired profile, got %+v", delivered[0].req.Profile)
+	}
+
+	// Once delivered, the assignment is spent: a further finish is a local
+	// no-op and the id can never be reacquired.
+	settled := len(rh.seen())
+	if err := router.Finish(context.Background(), assignment.ID, OutcomeSuccess); err != nil {
+		t.Fatalf("a finish after a delivered one must be a silent no-op, got %v", err)
+	}
+	if len(rh.seen()) != settled {
+		t.Fatal("a finish after a delivered one must not reach the hook again")
+	}
+	if _, _, err := router.Route(context.Background(), assignment.ID, "review-fix"); err == nil ||
+		!strings.Contains(err.Error(), "already closed") {
+		t.Fatalf("error %v must refuse reopening a settled assignment", err)
+	}
+}
+
+// TestRouter_FinishRefusedByTheControllerDoesNotSettleTheAssignment is the same
+// property for a hook that ran fine but answered with something Finish refuses.
+// The report did not land either way, so the debt must stay outstanding.
+func TestRouter_FinishRefusedByTheControllerDoesNotSettleTheAssignment(t *testing.T) {
+	var refuse bool
+	rh := &recordingHook{
+		reply: func(verb Verb, req Request) Response {
+			if verb == VerbFinish {
+				if refuse {
+					return Response{Result: resultError, Error: "unknown assignment"}
+				}
+				return Response{Result: resultClosed, AssignmentID: req.AssignmentID}
+			}
+			return selectFirstOffered(verb, req)
+		},
+	}
+	router := testRouter(t, rh, piGrokProfile())
+
+	assignment, _, err := router.Route(context.Background(), "run-1-launch-1", "review-fix")
+	if err != nil {
+		t.Fatalf("route: %v", err)
+	}
+
+	refuse = true
+	if err := router.Finish(context.Background(), assignment.ID, OutcomeSuccess); err == nil {
+		t.Fatal("a finish the controller refused must be reported to the caller")
+	}
+
+	refuse = false
+	before := len(rh.seen())
+	if err := router.Finish(context.Background(), assignment.ID, OutcomeSuccess); err != nil {
+		t.Fatalf("retrying a refused finish: %v", err)
+	}
+	if len(rh.seen()) != before+1 {
+		t.Fatal("the retry must reach the hook")
+	}
+}
+
 // TestRouter_DeferredAssignmentIsRetriedNotCached proves a deferral is never
 // remembered as a verdict. The same attempt id can be acquired again, and once
 // the controller's evidence changes it is admitted, which is exactly the

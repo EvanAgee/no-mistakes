@@ -173,6 +173,15 @@ func (r *Router) Route(ctx context.Context, assignmentID, role string) (Assignme
 // report. The identity sent is exactly the one Route recorded, never a
 // caller-supplied profile, so a mis-wired caller cannot bill a route that
 // never ran.
+//
+// An id becomes closed only once the hook has actually accepted the report. A
+// report that never reached the controller leaves the assignment open with its
+// recorded profile intact, so a later finish for that same id carries it rather
+// than returning a local success for work the controller still counts as
+// running. Repeating a report is safe by contract: the finish verb is
+// idempotent at the hook, so the controller ignores one it has already closed.
+// This is bounded retry through the caller's existing cleanup paths and adds
+// no scheduler, goroutine or timer of its own.
 func (r *Router) Finish(ctx context.Context, assignmentID string, outcome Outcome) error {
 	if r == nil {
 		return nil
@@ -192,11 +201,9 @@ func (r *Router) Finish(ctx context.Context, assignmentID string, outcome Outcom
 		}
 		return fmt.Errorf("routing: assignment %q was never acquired by this run", assignmentID)
 	}
-	delete(r.open, assignmentID)
-	r.closed[assignmentID] = struct{}{}
 	r.mu.Unlock()
 
-	return r.hook.Finish(ctx, Request{
+	err := r.hook.Finish(ctx, Request{
 		AssignmentID: assignmentID,
 		Owner:        Owner{Identity: r.owner, Generation: r.generation},
 		Outcome:      outcome,
@@ -210,6 +217,15 @@ func (r *Router) Finish(ctx context.Context, assignmentID string, outcome Outcom
 			Effort:  string(profile.Tuning.Effort),
 		},
 	})
+	if err != nil {
+		return err
+	}
+
+	r.mu.Lock()
+	delete(r.open, assignmentID)
+	r.closed[assignmentID] = struct{}{}
+	r.mu.Unlock()
+	return nil
 }
 
 // allowedFor returns the approved profiles this role may use, sorted by id so

@@ -57,7 +57,10 @@ func NewRunRouting(router *routing.Router, runID string, newAgent func(routing.P
 // routedInvocation is what acquireRoute hands back to the invocation seam.
 type routedInvocation struct {
 	assignment routing.Assignment
-	// closed guards the single finish this invocation owes the hook.
+	// closed records that the finish this invocation owes the hook has been
+	// delivered and accepted. It is set only after a successful report, so a
+	// report that never reached the controller leaves the debt outstanding for
+	// a later path to settle rather than marking it paid.
 	closed atomic.Bool
 }
 
@@ -232,16 +235,23 @@ func (sctx *StepContext) routingContext() context.Context {
 	return sctx.Ctx
 }
 
-// finish closes an assignment exactly once. A second call is a no-op, so a
-// deferred cleanup and an explicit report cannot double-close.
-// A finish that never reaches the hook is never fatal to the turn, which has
-// already happened, but it must not be silent either: the router spends the id
-// locally before it calls out, so this is the only moment the failure exists.
-// The controller is left counting that route as in flight, which biases every
-// later acquire for every caller on this machine, and an operator seeing only
-// degraded balancing has no way back to the cause.
+// finish reports an assignment exactly once, counting only a report the
+// controller actually accepted.
+//
+// The latch is set after the report succeeds, not before, for the same reason
+// the router records the id as closed only then: an assignment the controller
+// never sees closed is one it keeps counting as running forever, which biases
+// every later acquire for every caller on this machine. Latching first would
+// mean the deferred release backstop silently skipped the one case it exists
+// to cover. Repeating a report is safe by contract, so a retry can only turn a
+// lost report into a delivered one.
+//
+// A report that still fails is never fatal to the turn, which has already
+// happened, but it must not be silent either: this is the last moment the
+// failure exists, and an operator seeing only degraded balancing afterwards has
+// no way back to the cause.
 func (r *RunRouting) finish(ctx context.Context, invocation *routedInvocation, outcome routing.Outcome) {
-	if r == nil || invocation == nil || !invocation.closed.CompareAndSwap(false, true) {
+	if r == nil || invocation == nil || invocation.closed.Load() {
 		return
 	}
 	if err := r.router.Finish(ctx, invocation.assignment.ID, outcome); err != nil {
@@ -250,7 +260,9 @@ func (r *RunRouting) finish(ctx context.Context, invocation *routedInvocation, o
 			"profile", invocation.assignment.Profile.ID,
 			"outcome", string(outcome),
 			"error", err)
+		return
 	}
+	invocation.closed.Store(true)
 }
 
 func describeModel(p routing.Profile) string {

@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -1098,5 +1099,73 @@ func TestAcquireRoute_HarnessThatProducesNoAgentFailsClosed(t *testing.T) {
 	}
 	if finishes[0].Outcome != routing.OutcomeLaunchFailed {
 		t.Fatalf("outcome = %q, want launch-failed", finishes[0].Outcome)
+	}
+}
+
+// TestRunAgent_FinishLostInTransitIsRetriedByTheReleaseBackstop proves the seam
+// still owes a report the controller never received.
+//
+// The seam reports the real outcome first, and the deferred release fires after
+// it as a backstop. If the invocation latched itself closed on the attempt
+// rather than on the delivery, that backstop would skip the one case it exists
+// for, and the controller would count the route as running forever with no path
+// left to correct it. The finish verb is idempotent at the hook, so retrying can
+// only turn a lost report into a delivered one.
+func TestRunAgent_FinishLostInTransitIsRetriedByTheReleaseBackstop(t *testing.T) {
+	var lose atomic.Bool
+	lose.Store(true)
+	transport := &fakeHookTransport{
+		reply: selectByID(routingPiGrokProfile().ID),
+		fail: func(verb routing.Verb, _ routing.Request) error {
+			if verb == routing.VerbFinish && lose.Load() {
+				lose.Store(false)
+				return errors.New("hook unavailable")
+			}
+			return nil
+		},
+	}
+	run := testRouting(t, transport, []routing.Profile{routingPiGrokProfile()},
+		func(p routing.Profile) (agent.Agent, error) { return &recordingAgent{profile: p}, nil })
+
+	sctx := &StepContext{Ctx: context.Background(), Agent: &hangingAgent{name: "configured"}, Routing: run}
+	if _, err := sctx.RunAgent(agent.RunOpts{Prompt: "repair", Purpose: "review-fix"}); err != nil {
+		t.Fatalf("a lost finish must not fail the turn, which already happened: %v", err)
+	}
+
+	finishes := transport.finishes()
+	if len(finishes) != 2 {
+		t.Fatalf("want the lost report and its retry, got %d finishes", len(finishes))
+	}
+	for i, finish := range finishes {
+		if finish.AssignmentID != finishes[0].AssignmentID {
+			t.Fatalf("finish %d reported assignment %q, want the same one throughout", i, finish.AssignmentID)
+		}
+	}
+	// The retry is the backstop's own honest report about a turn that did
+	// launch, not a fabricated success.
+	if finishes[1].Outcome != routing.OutcomeLaunchFailed {
+		t.Fatalf("the backstop retry reported %q, want launch-failed", finishes[1].Outcome)
+	}
+}
+
+// TestRunAgent_DeliveredFinishIsNotReportedTwice keeps the ordinary path
+// unchanged: once the controller has accepted a report, the release backstop
+// must stay silent rather than billing a second close for the same turn.
+func TestRunAgent_DeliveredFinishIsNotReportedTwice(t *testing.T) {
+	transport := &fakeHookTransport{reply: selectByID(routingPiGrokProfile().ID)}
+	run := testRouting(t, transport, []routing.Profile{routingPiGrokProfile()},
+		func(p routing.Profile) (agent.Agent, error) { return &recordingAgent{profile: p}, nil })
+
+	sctx := &StepContext{Ctx: context.Background(), Agent: &hangingAgent{name: "configured"}, Routing: run}
+	if _, err := sctx.RunAgent(agent.RunOpts{Prompt: "repair", Purpose: "review-fix"}); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	finishes := transport.finishes()
+	if len(finishes) != 1 {
+		t.Fatalf("want exactly one finish, got %d", len(finishes))
+	}
+	if finishes[0].Outcome != routing.OutcomeSuccess {
+		t.Fatalf("outcome = %q, want success", finishes[0].Outcome)
 	}
 }
