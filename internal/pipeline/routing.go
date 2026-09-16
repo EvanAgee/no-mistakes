@@ -62,6 +62,36 @@ type routedInvocation struct {
 	// report that never reached the controller leaves the debt outstanding for
 	// a later path to settle rather than marking it paid.
 	closed atomic.Bool
+	// recorded is the outcome the seam established for this turn, held so a
+	// retry reports what actually happened rather than re-deciding it. The
+	// backstop has no way to observe a turn it did not run, so without this it
+	// could only guess, and guessing `launch-failed` for a turn that completed
+	// tells the controller the route consumed nothing when it consumed a whole
+	// turn's quota.
+	recorded atomic.Pointer[routing.Outcome]
+}
+
+// rememberOutcome records what the seam established for this turn, so a later
+// retry of a lost report carries the same verdict.
+func (r *routedInvocation) rememberOutcome(outcome routing.Outcome) {
+	if r == nil {
+		return
+	}
+	r.recorded.Store(&outcome)
+}
+
+// outcomeForRetry is what a backstop should report. It is the recorded verdict
+// when the seam reached one, and `launch-failed` only when it never did: that
+// is the genuine no-outcome case the backstop exists for, a panic unwinding
+// through the seam before the turn's result was ever classified.
+func (r *routedInvocation) outcomeForRetry() routing.Outcome {
+	if r == nil {
+		return routing.OutcomeLaunchFailed
+	}
+	if recorded := r.recorded.Load(); recorded != nil {
+		return *recorded
+	}
+	return routing.OutcomeLaunchFailed
 }
 
 // ProfileKey is the session-reuse identity of the assigned profile. A nil
@@ -156,11 +186,14 @@ func (sctx *StepContext) acquireRoute(ctx context.Context, opts *agent.RunOpts, 
 		_ = routedAgent.Close()
 		*ag = previous
 		// Backstop: an assignment the controller never sees closed is one it
-		// keeps counting as running forever. The caller normally reports the
-		// real outcome first, and finish is idempotent, so this only fires on
-		// a path that skipped it - a panic unwinding through the seam. Such a
-		// turn did launch, so "failed" is the honest report.
-		r.finish(context.WithoutCancel(ctx), invocation, routing.OutcomeLaunchFailed)
+		// keeps counting as running forever. It fires in two shapes, and the
+		// outcome it reports must not conflate them. The caller normally
+		// records the real verdict first, so this either finds that debt
+		// already settled and does nothing, or retries the SAME verdict after
+		// a report the hook never accepted. Only when no verdict was ever
+		// reached - a panic unwinding through the seam before the turn was
+		// classified - does it report `launch-failed` on its own account.
+		r.finish(context.WithoutCancel(ctx), invocation, invocation.outcomeForRetry())
 	}
 	return invocation, true, release, nil
 }
@@ -198,10 +231,14 @@ func (sctx *StepContext) recordRouteOutcome(invocation *routedInvocation, err er
 	if sctx == nil || sctx.Routing == nil || invocation == nil {
 		return
 	}
+	outcome := classifyRouteOutcome(err)
+	// Remember the verdict before attempting it, so a report the hook never
+	// accepts is retried as what actually happened rather than re-guessed.
+	invocation.rememberOutcome(outcome)
 	// Finish must survive a cancelled invocation: the turn has already
 	// happened, and reporting it through the dead context would drop the
 	// record precisely when the controller most needs it.
-	sctx.Routing.finish(context.WithoutCancel(sctx.routingContext()), invocation, classifyRouteOutcome(err))
+	sctx.Routing.finish(context.WithoutCancel(sctx.routingContext()), invocation, outcome)
 }
 
 // classifyRouteOutcome maps an invocation's error to the controller's closed

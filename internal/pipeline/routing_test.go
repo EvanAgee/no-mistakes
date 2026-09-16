@@ -1141,10 +1141,91 @@ func TestRunAgent_FinishLostInTransitIsRetriedByTheReleaseBackstop(t *testing.T)
 			t.Fatalf("finish %d reported assignment %q, want the same one throughout", i, finish.AssignmentID)
 		}
 	}
-	// The retry is the backstop's own honest report about a turn that did
-	// launch, not a fabricated success.
-	if finishes[1].Outcome != routing.OutcomeLaunchFailed {
-		t.Fatalf("the backstop retry reported %q, want launch-failed", finishes[1].Outcome)
+	// The retry carries the verdict the seam actually reached. This turn
+	// completed, so it consumed the route's quota; reporting launch-failed
+	// would tell the controller the route consumed nothing and bias it back
+	// toward an already-spent subscription.
+	for i, finish := range finishes {
+		if finish.Outcome != routing.OutcomeSuccess {
+			t.Fatalf("finish %d reported %q for a turn that completed, want success", i, finish.Outcome)
+		}
+	}
+}
+
+// TestRunAgent_LostFinishForAFailedTurnRetriesTheSameFailure is the other half:
+// the retry must not invent a success either. A turn that failed reports
+// launch-failed, and a retry of that lost report carries the same verdict.
+func TestRunAgent_LostFinishForAFailedTurnRetriesTheSameFailure(t *testing.T) {
+	var lose atomic.Bool
+	lose.Store(true)
+	transport := &fakeHookTransport{
+		reply: selectByID(routingPiGrokProfile().ID),
+		fail: func(verb routing.Verb, _ routing.Request) error {
+			if verb == routing.VerbFinish && lose.Load() {
+				lose.Store(false)
+				return errors.New("hook unavailable")
+			}
+			return nil
+		},
+	}
+	run := testRouting(t, transport, []routing.Profile{routingPiGrokProfile()},
+		func(p routing.Profile) (agent.Agent, error) {
+			return &recordingAgent{profile: p, runFn: func(context.Context, agent.RunOpts) (*agent.Result, error) {
+				return nil, errors.New("the adapter failed")
+			}}, nil
+		})
+
+	sctx := &StepContext{Ctx: context.Background(), Agent: &hangingAgent{name: "configured"}, Routing: run}
+	if _, err := sctx.RunAgent(agent.RunOpts{Prompt: "repair", Purpose: "review-fix"}); err == nil {
+		t.Fatal("a failed turn must still fail the caller")
+	}
+
+	finishes := transport.finishes()
+	if len(finishes) != 2 {
+		t.Fatalf("want the lost report and its retry, got %d finishes", len(finishes))
+	}
+	for i, finish := range finishes {
+		if finish.Outcome != routing.OutcomeLaunchFailed {
+			t.Fatalf("finish %d reported %q for a failed turn, want launch-failed", i, finish.Outcome)
+		}
+	}
+}
+
+// TestRelease_WithNoRecordedOutcomeReportsLaunchFailed pins the case the
+// backstop was actually written for: the seam never reached a verdict at all,
+// because a panic unwound through it before the turn was classified. There is
+// nothing to carry forward, so reporting launch-failed is the honest answer and
+// releases the assignment rather than leaving it counted as running.
+func TestRelease_WithNoRecordedOutcomeReportsLaunchFailed(t *testing.T) {
+	transport := &fakeHookTransport{reply: selectByID(routingPiGrokProfile().ID)}
+	run := testRouting(t, transport, []routing.Profile{routingPiGrokProfile()},
+		func(p routing.Profile) (agent.Agent, error) { return &recordingAgent{profile: p}, nil })
+
+	sctx := &StepContext{Ctx: context.Background(), Agent: &hangingAgent{name: "configured"}, Routing: run}
+	opts := agent.RunOpts{Prompt: "repair", Purpose: "review-fix"}
+	var ag agent.Agent = sctx.Agent
+	invocation, routed, release, err := sctx.acquireRoute(context.Background(), &opts, &ag)
+	if err != nil || !routed {
+		t.Fatalf("acquire: routed=%v err=%v", routed, err)
+	}
+
+	// The seam never classifies this turn, exactly as a panic unwinding
+	// through it would leave things, so only the deferred release runs.
+	func() {
+		defer release()
+		defer func() { _ = recover() }()
+		panic("the turn blew up before its outcome was classified")
+	}()
+
+	if invocation.outcomeForRetry() != routing.OutcomeLaunchFailed {
+		t.Fatalf("an unclassified turn must retry as launch-failed, got %q", invocation.outcomeForRetry())
+	}
+	finishes := transport.finishes()
+	if len(finishes) != 1 {
+		t.Fatalf("want exactly one finish from the backstop, got %d", len(finishes))
+	}
+	if finishes[0].Outcome != routing.OutcomeLaunchFailed {
+		t.Fatalf("the backstop reported %q, want launch-failed", finishes[0].Outcome)
 	}
 }
 
